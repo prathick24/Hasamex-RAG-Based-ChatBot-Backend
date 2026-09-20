@@ -27,13 +27,13 @@
 
 The application performs end-to-end analysis of three plain-text expert-call transcripts (Transcript_1_France.txt, Transcript_2_Germany.txt, Transcript_3_UK.txt) driven by the six-question interview guide in datas/Interview_Guide.txt. The pipeline is: parse → chunk → embed → store → retrieve → generate.
 
-1. **Ingestion:** Each transcript is parsed to extract expert metadata (name, role, market) from the header and split the body into speaker turns using `MM:SS` timestamp regex. Each turn becomes a chunk record with `transcript_id`, `speaker`, `timestamp`, `content`, and a `speaker_index` (IN_00, EX_00, ...) for ordering and idempotency.
+1. **Ingestion:** Each transcript is parsed to extract expert metadata (name, role, market) from the header and split the body into speaker turns using `MM:SS` timestamp regex. Each expert turn becomes a chunk record with `transcript_id`, `speaker`, `timestamp`, `content`, and a `speaker_index` (IN_00, EX_00, ...) for ordering and idempotency. To keep chunks self-contained, the interviewer question that precedes an expert answer is bundled into that chunk's content as a `Q:` prefix — the answer then carries the timeframe/scope it relies on (e.g. "next three to five years"). Interviewer-only turns are not stored as separate chunks.
 2. **Embedding:** Every chunk is embedded with `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) locally — no external embedding API.
 3. **Storage:** Chunks + embeddings are stored in PostgreSQL with the pgvector extension (cosine similarity via `<=>`). Ingestion is idempotent (`ON CONFLICT DO NOTHING` on transcript_id + speaker_index).
 4. **Interview Guide Answers:** For each of the 6 questions and each expert, retrieval is scoped to that expert's transcript only, and the LLM (Groq, open-source model) generates an answer with citations. Retrieval per-expert prevents cross-expert contamination.
 5. **Exact Quote Extraction:** Built into the chat — when the user requests a verbatim quote, the LLM is bypassed and hybrid search (semantic + keyword) returns verified verbatim chunks with timestamps.
 6. **Themes & Disagreements:** Per interview-guide topic, chunks from all three experts are retrieved and the LLM returns a theme breakdown labelled `Consensus` / `Disagreement` / `Emphasis` with citations.
-7. **Cross-Transcript Q&A:** The user's free-form question is embedded, top-K chunks are retrieved across ALL transcripts via cosine similarity, and the LLM generates a grounded answer with citations — or states "Not mentioned in the available transcripts" when nothing relevant is found.
+7. **Cross-Transcript Q&A:** The user's free-form question is embedded, top-K chunks are retrieved across ALL transcripts via cosine similarity, and the LLM generates a grounded answer with citations — or a friendly "couldn't find it in these transcripts" reply when nothing relevant is found. Greetings/pleasantries short-circuit to a polite scope message.
 
 The application follows the layered architecture mandated by the project standards: Routes → Middleware → Services → Repositories → Data Store, with Groq LLM and local sentence-transformers accessed via client modules. A Streamlit frontend consumes the FastAPI backend. The UI is simple and usable: tabs for Interview Guide Answers, Themes & Disagreements, and Ask a Question (which includes exact-quote retrieval).
 
@@ -46,6 +46,7 @@ The application follows the layered architecture mandated by the project standar
 - **FR-005: Cross-Transcript Question Answering (RAG Chat)**
 - **FR-006: Citation and Hallucination Control**
 - **FR-007: Streamlit Frontend**
+- **FR-008: Internal Traceability (Record Keeping)**
 
 ---
 
@@ -66,7 +67,7 @@ The application reads all transcripts from the `datas/` directory at startup, pa
 - **Header:** First three non-empty lines map to `Expert N – Name` (expert_name), `Role: ...` (expert_role), `Market: ...` (market).
 - **Body:** The remainder is split on lines matching timestamp regex `^\d{1,2}:\d{2}$` (handles `MM:SS`). Each timestamped line starts a new turn; text accumulates until the next timestamp.
 - **Speaker:** Determined from the speaker label prefix (`Interviewer:` or expert name `Dr. Martin:` / `Anna Keller:`). If the line does not start with a known label, the previous speaker is inherited.
-- **Chunk record fields:** `transcript_id` (FK), `speaker` (`Interviewer` or `Expert`), `speaker_index` (sequential `IN_00`, `EX_00`, ...), `timestamp` (`MM:SS`), `content` (trimmed, non-empty), `embedding`.
+- **Chunk record fields:** `transcript_id` (FK), `speaker` (`Interviewer` or `Expert`), `speaker_index` (sequential `IN_00`, `EX_00`, ...), `timestamp` (`MM:SS`), `content` (trimmed, non-empty; expert chunks prefixed with the preceding interviewer question as `Q: ...\nA: ...`), `embedding`.
 
 ##### Storage & Idempotency:
 - Tables: `transcripts` and `chunks` (ER diagram in `design/er_diagram.mmd`).
@@ -107,12 +108,14 @@ For each of the six interview-guide questions, the application returns an answer
 ##### Generation:
 - LLM tasks: interview-guide answer.
 - Prompt contract (per prompt-engineering standards): Role, Mission, Context (retrieved chunks only), Inputs, Constraints, Rules, Critical Rules, Output Contract, Error Handling.
-- Output is strict JSON: `{"question_id": int, "expert": str, "answer": str, "citations": [{"transcript_file": str, "expert_name": str, "market": str, "timestamp": str, "quote": str}]}`.
+- Output is strict JSON, answered in batches of up to 3 questions per LLM call:
+  `{"answers": [{"question_id": int, "answer": str, "citations": [{"transcript_file": str, "expert_name": str, "market": str, "timestamp": str, "quote": str}]}]}`.
 - Temperature: 0.0–0.2 for stable, grounded output.
 - If no relevant chunk is retrieved, answer = "Not mentioned in this transcript", citations = [].
+- Failure containment: if an LLM call for a batch fails after retries, each question in that batch falls back to the friendly message "Oops - we hit a snag generating this one..." with empty citations; the stream still emits every batch and a final `done` event (a failed batch never leaves the stream unfinished).
 
 ##### Caching:
-- Deterministic result cached keyed by `(task="interview_guide", question_id, expert_id, context_hash)` to avoid repeat cost and variance.
+- Deterministic result cached keyed by `(task="interview_guide_batch", model, transcript filename, question-text + retrieved-context hash)` to avoid repeat cost and variance.
 
 ##### Acceptance Criteria:
 - 6 questions × 3 experts = 18 answers returned (or cached).
@@ -162,8 +165,8 @@ Quote retrieval is built into the chat endpoint — there is no separate quotes 
 The application surfaces, per interview-guide topic, what the three experts agree on (consensus), where they differ (disagreement), and where they simply differ in emphasis.
 
 ##### Process:
-- For each of the 6 topics/question, retrieve top-K chunks from each of the 3 experts (or reuse the interview-guide retrieval results by question).
-- Assemble the retrieved chunks across all three experts into one context block tagged by expert.
+- For each of the 6 topics/question, run a single cross-corpus similarity search retrieving the top-K most similar chunks across all three transcripts (each tagged by expert); the interview-guide retrieval results may be reused where available.
+- Assemble the retrieved chunks into one context block tagged by expert.
 - LLM analysed with a typed output contract returning:
 ```
 {
@@ -176,6 +179,7 @@ The application surfaces, per interview-guide topic, what the three experts agre
 }
 ```
 - Labelling rule: experts state conflicting facts/numbers/timelines → `Disagreement`; experts agree but weight factors differently → `Emphasis`; experts converge on the same point → `Consensus`.
+- Per-topic isolation: each topic is analysed in its own LLM call. Malformed theme/citation records (non-dict `themes`/`citations` items) are skipped with a logged warning and unknown labels default to `Emphasis`. A transient LLM failure on one topic (caught per-topic) flags that entry as an error (`error: true`) — it never aborts the remaining topics, and the stream always ends with a final `done` event. The UI shows an explicit "snag – please refresh" message for a failed topic, which is distinct from a successfully analysed topic that finds no themes ("No themes identified for this topic.").
 
 ##### Expected outcome (from transcript analysis):
 - Q6 (purchase timeline): France 6–12 months, Germany 9–18 months, UK 6–9 months → surfaced as `Disagreement` (numeric range) citing all three timestamps.
@@ -187,6 +191,7 @@ The application surfaces, per interview-guide topic, what the three experts agre
 - Each theme labelled precisely as one of Consensus / Disagreement / Emphasis.
 - Each theme carries citations from the involved experts (name, market, timestamp, quote).
 - Numeric disagreements (timeline) surfaced with explicit range and all 3 sources.
+- A transient failure on one topic is flagged as an error entry; the remaining topics proceed and the stream always terminates with `done`.
 
 ---
 
@@ -209,11 +214,12 @@ Single chat endpoint supporting two modes: (1) RAG answer — free-form question
 ##### System prompt critical rules (mode=answer):
 - Use ONLY the provided context.
 - Never add information not present in the context.
-- If context does not answer the question, respond exactly "Not mentioned in the available transcripts."
+- If context does not answer the question, reply politely that the answer could not be found in these transcripts and name what the interviews do cover.
 - Cite each claim with its source chunk (transcript, expert, timestamp).
 
 ##### Empty/relevance guard:
-- If all retrieved chunks fall below a similarity threshold, return graceful "not covered" response (no guessing).
+- If all retrieved chunks fall below a similarity threshold, return a graceful, friendly "could not find it in these transcripts" response that names the covered topics (no guessing).
+- Greetings, pleasantries, and capability questions (e.g. "hi", "thank you", "what can you do?") short-circuit to a polite scope message without retrieval or LLM cost.
 
 ##### Statelessness:
 - The endpoint is stateless; the frontend owns conversation history display.
@@ -221,7 +227,7 @@ Single chat endpoint supporting two modes: (1) RAG answer — free-form question
 ##### Acceptance Criteria:
 - Any question on adoption/barriers/ROI/training/trends/timeline answered with citations.
 - "Exact quote" phrasing bypasses the LLM and returns verified verbatim chunks.
-- Off-topic or unanswerable questions return "Not mentioned in the available transcripts."
+- Greetings/pleasantries return a friendly scope message; off-topic or unanswerable questions receive a polite "could not find it in these transcripts" reply naming the covered topics.
 - Every citation is verifiable against the source transcript.
 - No cross-tenant or cross-user state (stateless).
 
@@ -262,7 +268,11 @@ A simple single-page Streamlit app exposing three analysis views, calling only t
 
 ##### Behaviour:
 - Spinner/loading states during backend calls.
-- Errors surfaced gracefully (stale connection, 5xx, rate-limit) without crashing the app.
+- Errors surfaced gracefully (stale connection, 5xx, rate-limit) without crashing the app, with an explicit Retry action; a failed/partial stream is cached in session state so reruns do not silently re-stream it.
+- Guide/themes render from frontend session state once loaded — tab clicks and widget interactions never retrigger the stream.
+- Chat conversation persisted in session state; turns remain visible across reruns.
+- Chat layout: message history renders inside a fixed-height scroll container with the chat input pinned at the bottom, so the page never grows and only the chat area scrolls (the input sits below the last message, after every rerun).
+- The app launches with `.streamlit/config.toml` (`client.toolbarMode = "viewer"`) which removes developer-only toolbar buttons (deploy/pop-out/rerun) while keeping the running-status indicator.
 - No DB or LLM access from the frontend — all data via the HTTP API.
 
 ##### Acceptance Criteria:
@@ -271,6 +281,29 @@ A simple single-page Streamlit app exposing three analysis views, calling only t
 - App does not crash on backend unavailability; shows a clear error message.
 
 ---
+
+##### <u>1.2.8 FR-008: Internal Traceability (Record Keeping)</u>
+
+##### Description:
+A durable record of what the backend actually did — Q&A turns, errors, and every Groq call — stored in three tables and readable through simple API endpoints, so an operator can audit behaviour after the fact without trusting memory or only grepping logs.
+
+##### Tables:
+| Table | Rows |
+|-------|------|
+| `chat_history` | One row per Q&A turn: question, mode (answer/quote), answer, citations (JSON), verification status, model, latency, timestamp |
+| `error_logs` | One row per recorded failure: level, component (`qa`/`themes`/`guide`/…), message, exception type, endpoint, method, structured detail (JSON), timestamp |
+| `llm_usage_log` | One row per Groq call: task (`qa_answer`/`themes`/`guide_batch`/…), model, prompt/completion/total tokens, latency, success, timestamp |
+
+##### Behaviour:
+- Recording is **best-effort**: each write opens its own short-lived session; a storage failure is logged and never aborts the primary request or streaming contract.
+- The Groq client reports every call (tokens + latency + success) through an injected usage recorder wired in `get_services()`; failed calls are recorded too.
+- Service and route error paths record into `error_logs`: theme/guide per-item failures inside the guard clauses, Q&A `LLMError`s in the route.
+- Read endpoints: `GET /api/v1/chat/history`, `GET /api/v1/error-logs`, `GET /api/v1/llm-usage` — each returns the most recent `limit` rows (default 50, max 500).
+
+##### Acceptance Criteria:
+- Every Q&A turn, LLM call, and recorded error is persisted to the DB.
+- Regardless of DB state, the primary request behaviour (including streaming) is identical — recording can only add a log line.
+- The three read endpoints return well-formed JSON lists, newest first.
 
 #### <u>1.3 Project Artifacts</u>
 
@@ -330,7 +363,7 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 
 ##### NFR-002: Configuration
 
-- `.env` + `.env.sample`; keys: `GROQ_API_KEY`, `DATABASE_URL`, `MODEL_ID` (default `llama-3.3-70b-versatile`), `EMBEDDING_MODEL` (default `all-MiniLM-L6-v2`), `TOP_K` (default 5), `LOG_LEVEL`.
+- `.env` + `.env.sample`; keys: `GROQ_API_KEY`, `DATABASE_URL`, `LLM_MODEL` (default `openai/gpt-oss-120b`), `EMBEDDING_MODEL` (default `all-MiniLM-L6-v2`), `TOP_K` (default 5), `LOG_LEVEL`.
 - Validated at startup via Pydantic Settings; missing `GROQ_API_KEY`/`DATABASE_URL` raises a clear startup error.
 - `.env` entries in `.gitignore`.
 
@@ -363,14 +396,14 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 
 #### <u>2.2.3 Availability and Reliability</u>
 
-- Groq client retry with exponential backoff (tenacity: 3 attempts, 2s→10s); 429/5xx handled.
+- Groq client retry with exponential backoff (tenacity: 5 attempts, 2s→10s); 429/5xx handled.
 - Graceful degradation: if Groq is down, API returns a structured error, frontend shows retry message.
 - Idempotent ingestion → safe restarts.
 - Readiness endpoint fails (503) if DB/pgvector/tables unavailable, guiding the demo.
 
 #### <u>2.2.4 Cost Efficiency</u>
 
-- Groq free tier used; open-source models (llama-3.3-70b-versatile) — $0 until demo scale.
+- Groq free tier used; open-source models (openai/gpt-oss-120b) — $0 until demo scale.
 - Embeddings run locally — zero cost.
 - Result caching avoids repeat LLM tokens during demos.
 - Total stack cost: $0 (Groq free tier, local PG, local embeddings).
@@ -397,6 +430,8 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 - Free-form cross-transcript Q&A (RAG) with "not mentioned" guard.
 - Strict citation + hallucination control (typed contracts, grounding, verified quotes).
 - FastAPI backend with versioned routes (`/api/v1`), health/ready endpoints.
+- Transcript upload API (`POST /api/v1/transcripts/upload`, `GET /api/v1/transcripts`, `DELETE /api/v1/transcripts/{id}`) with per-file results, soft-delete (`is_active`), and per-filename versioning so replaced files disappear from all retrieval and cached analysis.
+- NDJSON streaming endpoints for interview-guide and themes (`/interview-guide/stream`, `/themes/stream`) so the frontend renders results progressively as batches/topics complete.
 - Streamlit frontend with 3 tabs consuming the API.
 - Structured logging; rich cache for deterministic LLM outputs.
 - `requirements.md`, `er_diagram.mmd`, `openapi.yaml`, `external-api.yaml` artifacts.
@@ -406,11 +441,12 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 #### <u>3.2 Out Scope Details</u>
 
 - Authentication / multi-user support (local single-user demo).
-- Persistent chat history / session memory on the backend.
+- Persistent chat history / session memory on the backend (the visible conversation lives in the frontend; the backend only records Q&A turns into `chat_history` for traceability — see FR-008).
+- Traceability recording is best-effort and must never break the primary request or streaming contract.
 - Audio / PDF / speech-to-text ingestion (transcripts are plain text only).
-- Operational machinery for 30+ transcript scale: upload/file-manager UI, ingestion worker with per-file status tracking, re-embedding diffs, chunk versioning.
+- Upload/file-manager *frontend* UI (backend upload endpoints exist; the Streamlit UI is read-only for analysis).
+- Operational machinery for storage-layer chunk diffs / cache staleness tracking (soft-delete + versioning covers file replacement; no worker or per-chunk flag system).
 - HNSW/IVFFlat vector index creation and tuning (default index/scan order is sufficient at this scale — explain in demo, do not implement).
-- Streaming/SSE responses.
 - Fine-tuning of any model.
 - Cloud deployment / Docker images.
 - Automatic re-indexing on transcript file changes.
@@ -432,9 +468,9 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 3. Intent detection confirms `mode=answer` (normal question).
 4. Service embeds question with sentence-transformers.
 5. Repository executes vector search across ALL chunks (`ORDER BY embedding <=> :q LIMIT 5`).
-6. If no chunk above similarity threshold → service returns answer "Not mentioned in the available transcripts." with empty citations.
+6. If no chunk above similarity threshold → service returns the friendly "could not find it in these transcripts" fallback with empty citations.
 7. Otherwise service assembles prompt (system rules + retrieved chunks + user question).
-8. GroqClient calls LLM; tenacity retry on 429/5xx (3 attempts).
+8. GroqClient calls LLM; tenacity retry on 429/5xx (5 attempts).
 9. Service parses+validates JSON against typed response contract.
 10. For every citation quote, service runs substring verification against chunk content.
 11. Route returns `{question, mode, answer, citations}` → frontend renders answer + citations.
@@ -455,6 +491,15 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 3. Embed each chunk with sentence-transformers.
 4. Repository upserts transcripts then chunks (`ON CONFLICT DO NOTHING`).
 5. Returns final transcripts_count and chunks_count.
+
+**Flow: Transcript Upload (`POST /api/v1/transcripts/upload`)**
+
+1. Operator posts one or more `.txt` files (multipart) from any client.
+2. Route validates each file: `.txt` extension, non-empty, ≤ 5 MB; per-file errors are reported without failing the batch.
+3. Service parses the raw content, embeds its expert chunks, and calls `upload_version` in the repository.
+4. Repository deactivates any active transcript with the same filename (`is_active = false`), assigns the next `version` (max + 1), inserts the new transcript and its chunks, and commits in one transaction.
+5. Service purges the in-memory interview-guide cache prefix for that filename.
+6. Route returns per-file results: `uploaded` or `replaced` (with transcript_id, version, chunk_count) or `error` with reason.
 
 #### <u>4.3 Architectural Diagram</u>
 
@@ -484,7 +529,7 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
                                   │               │
                     ┌─────────────▼──────┐        │ cosine (<=>)
                     │  GroqClient        │        │
-                    │  (LLM llama-3.3)   │────────┘
+                    │  (LLM gpt-oss-120b)│────────┘
                     └─────────────┬──────┘
                                   │  HTTPS
                     ┌─────────────▼──────┐

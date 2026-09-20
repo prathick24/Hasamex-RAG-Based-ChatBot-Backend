@@ -1,6 +1,11 @@
 import pytest
 
-from src.services.qa_service import QAService, detect_quote_intent
+from src.services.qa_service import (
+    NO_CONTEXT_FALLBACK,
+    QAService,
+    detect_off_topic,
+    detect_quote_intent,
+)
 
 
 class FakeRepo:
@@ -31,7 +36,7 @@ class FakeGroq:
     def __init__(self, payload) -> None:
         self._payload = payload
 
-    async def parse_json_completion(self, messages, temperature=0.2, max_tokens=2048):
+    async def parse_json_completion(self, messages, temperature=0.2, max_tokens=2048, task=None):
         return self._payload
 
 
@@ -96,7 +101,7 @@ async def test_answer_with_chunks_and_citations(monkeypatch):
 async def test_answer_returns_not_mentioned_with_empty_chunks():
     svc = build_service(semantic=[])
     result = await svc.answer("Random question")
-    assert result.answer == "Not mentioned in the available transcripts."
+    assert result.answer == NO_CONTEXT_FALLBACK
     assert result.citations == []
 
 
@@ -104,7 +109,7 @@ async def test_answer_fallback_when_llm_blank(monkeypatch):
     svc = build_service(payload={"answer": "", "citations": []}, semantic=[chunk()])
     monkeypatch.setattr("src.services.dependencies.get_groq_client", lambda: svc._deps.groq)
     result = await svc.answer("q")
-    assert result.answer == "Not mentioned in the available transcripts."
+    assert result.answer == NO_CONTEXT_FALLBACK
 
 
 async def test_quote_mode_returns_verbatim_chunks():
@@ -150,10 +155,30 @@ async def test_ask_respects_explicit_mode():
     svc = build_service(semantic=[])
     result = await svc.ask("Is training important?", mode="answer")
     assert result.mode == "answer"
-    assert result.answer == "Not mentioned in the available transcripts."
+    assert result.answer == NO_CONTEXT_FALLBACK
 
 
 async def test_ask_auto_detects_quote():
     svc = build_service(semantic=[chunk()])
     result = await svc.ask("give me the exact quote about training")
     assert result.mode == "quote"
+
+
+async def test_greeting_returns_friendly_scope_reply():
+    svc = build_service()
+    result = await svc.ask("Hi!")
+    assert result.mode == "answer"
+    assert "robotic surgery" in result.answer
+    assert result.citations == []
+    assert result.answer != NO_CONTEXT_FALLBACK
+
+
+def test_detect_off_topic_matches_greetings():
+    assert detect_off_topic("Hi there")
+    assert detect_off_topic("good morning")
+    assert detect_off_topic("thank you!")
+    assert detect_off_topic("what can you do?")
+    assert detect_off_topic("hello everyone")
+    assert detect_off_topic("Is training important?") is False
+    assert detect_off_topic("What slows down adoption in Germany?") is False
+    assert detect_off_topic("Hi, can you tell me about adoption?") is False

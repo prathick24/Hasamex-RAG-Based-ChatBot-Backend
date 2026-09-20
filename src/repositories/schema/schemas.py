@@ -51,6 +51,29 @@ class IngestionResult(BaseModel):
     created_chunks: int = 0
 
 
+class UploadFileResult(BaseModel):
+    filename: str
+    status: str = "uploaded"
+    transcript_id: int | None = None
+    version: int | None = None
+    chunk_count: int = 0
+    reason: str | None = None
+
+
+class UploadBatchResult(BaseModel):
+    processed: int = 0
+    succeeded: int = 0
+    results: list[UploadFileResult] = Field(default_factory=list)
+
+
+class TranscriptListResult(BaseModel):
+    transcripts: list[TranscriptRecord] = Field(default_factory=list)
+
+
+class DeleteTranscriptResult(BaseModel):
+    deleted: bool
+
+
 class InterviewGuideAnswer(BaseModel):
     question_id: int
     expert: str
@@ -73,6 +96,7 @@ class Theme(BaseModel):
 class ThemeEntry(BaseModel):
     topic: str
     themes: list[Theme]
+    error: bool = False
 
 
 class AnswerModeResponse(BaseModel):

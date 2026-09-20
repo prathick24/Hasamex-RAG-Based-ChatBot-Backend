@@ -20,7 +20,7 @@ paths:
       summary: Generate chat completion
       description: >
         Sends grounded context + prompt to an open-source LLM served by Groq.
-        Model: llama-3.3-70b-versatile (default), configurable via settings.
+        Model: openai/gpt-oss-120b (default), configurable via settings.
         Used for: interview-guide answers, theme/disagreement analysis,
         quote candidate selection, and cross-transcript Q&A.
       security:
@@ -33,7 +33,7 @@ paths:
               type: object
               required: [model, messages]
               properties:
-                model: { type: string, example: "llama-3.3-70b-versatile" }
+                model: { type: string, example: "openai/gpt-oss-120b" }
                 messages:
                   type: array
                   items:
@@ -56,7 +56,7 @@ paths:
         '429':
           description: Rate limit exceeded (client must retry with backoff)
         '5xx':
-          description: Groq outage (client must retry with backoff, max 3 attempts)
+          description: Groq outage (client must retry with backoff, max 5 attempts)
 
 components:
   securitySchemes:

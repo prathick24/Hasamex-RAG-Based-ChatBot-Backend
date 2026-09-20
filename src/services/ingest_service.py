@@ -1,17 +1,24 @@
 import asyncio
-import logging
 from pathlib import Path
 
 from src.client.embedder_client import EmbedderClient
-from src.repositories.schema.schemas import IngestionResult
+from src.repositories.schema.schemas import IngestionResult, TranscriptRecord
 from src.repositories.transcript_repository import TranscriptRepository
+from src.services.cache import purge_by_prefix
 from src.settings import Settings
 from src.utils.exceptions.exceptions import IngestionError
-from src.utils.parser import parse_transcript_file
-
-logger = logging.getLogger("hasamex.ingest")
+from src.utils.logger import logger
+from src.utils.parser import parse_transcript_file, parse_transcript_text
 
 MAX_CONCURRENT_EMBEDS = 8
+
+
+def _bundle_expert_answer(content: str, question: str | None) -> str:
+    """Make a chunk self-contained by attaching the interviewer's preceding
+    question, which carries the timeframe/scope that the answer relies on."""
+    if question:
+        return f"Q: {question}\nA: {content}"
+    return content
 
 
 class IngestService:
@@ -34,6 +41,26 @@ class IngestService:
             raise IngestionError(f"No .txt transcript files found in {self._transcript_dir}")
         return files
 
+    def _build_expert_chunks(
+        self, parsed_transcript, include_filename: bool = True
+    ) -> list[dict]:
+        chunks: list[dict] = []
+        pending_question: str | None = None
+        for turn in parsed_transcript.turns:
+            if turn.speaker == "Interviewer":
+                pending_question = turn.content
+                continue
+            chunk = {
+                "speaker": turn.speaker,
+                "speaker_index": turn.speaker_index,
+                "timestamp": turn.timestamp,
+                "content": _bundle_expert_answer(turn.content, pending_question),
+            }
+            if include_filename:
+                chunk["filename"] = parsed_transcript.filename
+            chunks.append(chunk)
+        return chunks
+
     async def ingest_all(self) -> IngestionResult:
         try:
             files = self._discover_files()
@@ -51,18 +78,7 @@ class IngestService:
 
             all_chunks: list[dict] = []
             for parsed_transcript in parsed:
-                for turn in parsed_transcript.turns:
-                    if turn.speaker == "Interviewer":
-                        continue
-                    all_chunks.append(
-                        {
-                            "filename": parsed_transcript.filename,
-                            "speaker": turn.speaker,
-                            "speaker_index": turn.speaker_index,
-                            "timestamp": turn.timestamp,
-                            "content": turn.content,
-                        }
-                    )
+                all_chunks.extend(self._build_expert_chunks(parsed_transcript))
 
             await self._embed_chunks(all_chunks)
 
@@ -80,3 +96,47 @@ class IngestService:
             embeddings = await asyncio.to_thread(self._embedder.embed, batch)
             for i, embedding in enumerate(embeddings):
                 chunks[start + i]["embedding"] = embedding
+
+    async def ingest_single_file(self, filename: str, content: str) -> dict:
+        """Parse and persist one uploaded transcript, replacing any older version
+        with the same filename. Returns upload outcome with chunk count."""
+        parsed = parse_transcript_text(filename, content)
+
+        transcript_dict = {
+            "filename": parsed.filename,
+            "expert_name": parsed.expert_name,
+            "expert_role": parsed.expert_role,
+            "market": parsed.market,
+        }
+        chunks: list[dict] = self._build_expert_chunks(parsed, include_filename=False)
+        await self._embed_chunks(chunks)
+        if not chunks:
+            raise IngestionError(f"No expert chunks found in {filename}")
+
+        transcript_id, replaced, version = await self._repository.upload_version(
+            transcript_dict, chunks
+        )
+        purged = purge_by_prefix(f"interview_guide_batch::{parsed.filename}::")
+        logger.info(
+            "transcript_uploaded",
+            filename=parsed.filename,
+            replaced=replaced,
+            version=version,
+            chunks=len(chunks),
+            cache_purged=purged,
+        )
+        return {
+            "transcript_id": transcript_id,
+            "replaced": replaced,
+            "version": version,
+            "chunk_count": len(chunks),
+        }
+
+    async def list_ingested(self) -> list[TranscriptRecord]:
+        return await self._repository.list_transcripts()
+
+    async def delete_transcript(self, transcript_id: int) -> bool:
+        filename = await self._repository.soft_delete_transcript(transcript_id)
+        if filename:
+            purge_by_prefix(f"interview_guide_batch::{filename}::")
+        return bool(filename)

@@ -1,4 +1,11 @@
-from src.services.cache import LRUCache, acached_result, cached_result, clear_cache, make_cache_key
+from src.services.cache import (
+    LRUCache,
+    acached_result,
+    cached_result,
+    clear_cache,
+    make_cache_key,
+    purge_by_prefix,
+)
 
 
 def test_lru_cache_eviction():
@@ -73,3 +80,14 @@ async def test_acached_result_cache_hit():
     assert result1 == {"data": 42}
     assert result2 == {"data": 42}
     assert counter["count"] == 1
+
+
+def test_purge_by_prefix():
+    clear_cache()
+    cached_result("interview_guide_batch::a.txt::aaa", lambda: {"data": 1})
+    cached_result("interview_guide_batch::b.txt::bbb", lambda: {"data": 2})
+    cached_result("other::ccc", lambda: {"data": 3})
+    assert purge_by_prefix("interview_guide_batch::b.txt::") == 1
+    assert purge_by_prefix("interview_guide_batch::a.txt::") == 1
+    assert purge_by_prefix("interview_guide_batch::") == 0
+    assert purge_by_prefix("other::") == 1

@@ -4,6 +4,7 @@ from pathlib import Path
 from src.prompt import build_themes_messages
 from src.repositories.schema.schemas import Theme, ThemeEntry
 from src.repositories.transcript_repository import TranscriptRepository
+from src.services import audit_service
 from src.services.cache import acached_result, make_cache_key
 from src.services.citation_utils import (
     build_citation_context,
@@ -48,17 +49,25 @@ class ThemeService:
 
             groq = get_groq_client()
             messages = build_themes_messages(topic=topic, context=context)
-            return await groq.parse_json_completion(messages, temperature=0.2)
+            return await groq.parse_json_completion(
+                messages, temperature=0.2, task="themes"
+            )
 
         payload = await acached_result(cache_key, _produce)
 
         available = [chunk_to_dict(chunk) for chunk in chunks]
         themes: list[Theme] = []
-        for item in payload.get("themes", []):
+        for item in payload.get("themes") or []:
+            if not isinstance(item, dict):
+                logger.warning("skipping non-dict theme item: %r", item)
+                continue
             theme_type = str(item.get("type", "")).strip()
             if theme_type not in {"Consensus", "Disagreement", "Emphasis"}:
                 theme_type = "Emphasis"
-            citations, _ = verify_citations(item.get("citations", []), available)
+            citation_items = [
+                c for c in (item.get("citations") or []) if isinstance(c, dict)
+            ]
+            citations, _ = verify_citations(citation_items, available)
             themes.append(
                 Theme(
                     type=theme_type,
@@ -69,11 +78,54 @@ class ThemeService:
 
         return ThemeEntry(topic=topic, themes=themes)
 
-    async def get_themes(self) -> list[ThemeEntry]:
+    async def generate_themes(self):
+        """Yield theme data progressively, one topic's themes per event.
+
+        Events: {"type": "meta", "topics": [...]}, then one
+        {"type": "topic", "topic": ..., "themes": [...]} per topic, then
+        {"type": "done"}.
+        """
         guide_path = Path(self._settings.transcript_dir) / "Interview_Guide.txt"
         topics = load_interview_guide(guide_path)
 
-        entries = []
+        yield {
+            "type": "meta",
+            "topics": [{"index": i, "topic": topic} for i, topic in enumerate(topics, start=1)],
+        }
+
         for topic in topics:
-            entries.append(await self._analyze_topic(topic))
+            try:
+                entry = await self._analyze_topic(topic)
+            except Exception as exc:
+                logger.exception("theme topic analysis failed for: %s", topic)
+                await audit_service.record_error(
+                    component="themes",
+                    message=f"Theme analysis failed for topic: {topic}",
+                    exception_type=type(exc).__name__,
+                    endpoint="/api/v1/analysis/themes/stream",
+                    method="GET",
+                    detail={"topic": topic},
+                )
+                entry = ThemeEntry(topic=topic, themes=[], error=True)
+            yield {
+                "type": "topic",
+                "topic": topic,
+                "themes": [theme.model_dump() for theme in entry.themes],
+                "error": entry.error,
+            }
+
+        yield {"type": "done"}
+
+    async def get_themes(self) -> list[ThemeEntry]:
+        entries = []
+        async for event in self.generate_themes():
+            if event["type"] != "topic":
+                continue
+            entries.append(
+                ThemeEntry(
+                    topic=event["topic"],
+                    themes=[Theme(**theme) for theme in event["themes"]],
+                    error=event.get("error", False),
+                )
+            )
         return entries

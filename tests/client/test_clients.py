@@ -122,6 +122,74 @@ async def test_parse_json_completion_retries_then_raises():
         await client.parse_json_completion(messages=[])
 
 
+async def test_create_completion_records_usage_on_success():
+    recorded = []
+
+    async def recorder(usage):
+        recorded.append(usage)
+
+    client = GroqClient(make_settings())
+    client.usage_recorder = recorder
+    client._client = _client_with([_ok_response("the answer")])
+    result = await client.create_completion(
+        messages=[{"role": "user", "content": "hi"}], task="qa_answer"
+    )
+    assert result["content"] == "the answer"
+    assert len(recorded) == 1
+    usage = recorded[0]
+    assert usage["task"] == "qa_answer"
+    assert usage["model"] == "mock-llm"
+    assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 5
+    assert usage["total_tokens"] == 15
+    assert usage["success"] is True
+    assert usage["latency_ms"] >= 0
+
+
+async def test_create_completion_records_usage_on_failure():
+    recorded = []
+
+    async def recorder(usage):
+        recorded.append(usage)
+
+    client = GroqClient(make_settings())
+    client.usage_recorder = recorder
+    responses = [_status_response(s) for s in [500, 500, 500, 500, 500]]
+    client._client = _client_with(responses)
+    with pytest.raises(LLMError):
+        await client.create_completion(messages=[{"role": "user", "content": "hi"}])
+    assert len(recorded) == 1
+    assert recorded[0]["success"] is False
+    assert recorded[0]["task"] is None
+    assert recorded[0]["total_tokens"] is None
+
+
+async def test_create_completion_recorder_error_is_swallowed():
+    async def recorder(usage):
+        raise RuntimeError("recorder boom")
+
+    client = GroqClient(make_settings())
+    client.usage_recorder = recorder
+    client._client = _client_with([_ok_response("the answer")])
+    result = await client.create_completion(messages=[{"role": "user", "content": "hi"}])
+    assert result["content"] == "the answer"
+
+
+async def test_parse_json_completion_passes_task_to_completion():
+    recorded = []
+
+    async def recorder(usage):
+        recorded.append(usage)
+
+    client = GroqClient(make_settings())
+    client.usage_recorder = recorder
+    payload = {"answer": "synth", "citations": []}
+    client._client = _client_with([_ok_response(json.dumps(payload))])
+    result = await client.parse_json_completion(messages=[], task="themes")
+    assert result["answer"] == "synth"
+    assert recorded[0]["task"] == "themes"
+
+
 async def test_groq_network_error():
     client = GroqClient(make_settings())
 

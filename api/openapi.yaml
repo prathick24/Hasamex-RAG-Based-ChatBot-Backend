@@ -67,6 +67,98 @@ paths:
                   transcripts_count: { type: integer }
                   chunks_count: { type: integer }
                   loaded: { type: boolean }
+    get:
+      tags: [Transcripts]
+      summary: List active transcripts
+      description: >
+        Returns active (non-soft-deleted) transcripts with their expert metadata
+        and chunk counts, ordered by id.
+      responses:
+        '200':
+          description: List of active transcript records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transcripts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        filename: { type: string }
+                        expert_name: { type: string }
+                        expert_role: { type: string }
+                        market: { type: string }
+                        chunk_count: { type: integer }
+
+  /api/v1/transcripts/upload:
+    post:
+      tags: [Transcripts]
+      summary: Upload one or more transcript files
+      description: >
+        Multipart upload of .txt transcript files (max 5 MB each). Each file is parsed,
+        embedded, and stored. Re-uploading an existing filename soft-deletes the older
+        version and stores a new one (version increments); the interview-guide cache for
+        that file is purged. Per-file results report status: uploaded | replaced | error.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+      responses:
+        '200':
+          description: Per-file upload results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  processed: { type: integer }
+                  succeeded: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        filename: { type: string }
+                        status:
+                          type: string
+                          enum: [uploaded, replaced, error]
+                        transcript_id: { type: integer }
+                        version: { type: integer }
+                        chunk_count: { type: integer }
+                        reason: { type: string }
+
+  /api/v1/transcripts/{transcript_id}:
+    delete:
+      tags: [Transcripts]
+      summary: Soft-delete a transcript
+      description: >
+        Deactivates a transcript so it is excluded from retrieval, lists, and counts.
+        Its chunks remain in storage but are ignored by all active queries.
+      parameters:
+        - name: transcript_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: boolean }
 
   # ══════════════════════════════════════════════════
   # Interview Guide Answers
@@ -96,13 +188,8 @@ paths:
                       items:
                         type: object
                         properties:
-                          expert:
-                            type: object
-                            properties:
-                              id: { type: integer }
-                              name: { type: string }
-                              role: { type: string }
-                              market: { type: string }
+                          question_id: { type: integer }
+                          expert: { type: string, description: Expert name }
                           answer: { type: string }
                           citations:
                             type: array
@@ -114,6 +201,23 @@ paths:
                                 market: { type: string }
                                 timestamp: { type: string }
                                 quote: { type: string }
+
+  /api/v1/analysis/interview-guide/stream:
+    get:
+      tags: [Analysis]
+      summary: Stream interview guide answers (NDJSON)
+      description: >
+        Same data as /interview-guide but streamed line-by-line as Newline-Delimited JSON so
+        the frontend can render progress. Events:
+        - {"type":"meta","questions":[{"question_id","question"}]}  (once, first)
+        - {"type":"batch","expert":str,"answers":[...]}  (one per expert batch, up to 3 questions)
+        - {"type":"done"}
+        - {"type":"error","detail":str}  (on failure)
+      responses:
+        '200':
+          description: NDJSON event stream, one JSON object per line
+          content:
+            application/x-ndjson: {}
 
   # ══════════════════════════════════════════════════
   # Themes & Disagreements
@@ -154,6 +258,23 @@ paths:
                                 market: { type: string }
                                 timestamp: { type: string }
                                 quote: { type: string }
+
+  /api/v1/analysis/themes/stream:
+    get:
+      tags: [Analysis]
+      summary: Stream themes & disagreements (NDJSON)
+      description: >
+        Same data as /themes but streamed line-by-line as Newline-Delimited JSON so the
+        frontend can render progress. Events:
+        - {"type":"meta","topics":[{"index","topic"}]}  (once, first)
+        - {"type":"topic","topic":str,"themes":[...]}  (one per topic)
+        - {"type":"done"}
+        - {"type":"error","detail":str}  (on failure)
+      responses:
+        '200':
+          description: NDJSON event stream, one JSON object per line
+          content:
+            application/x-ndjson: {}
 
   # ══════════════════════════════════════════════════
   # Cross-Transcript Q&A

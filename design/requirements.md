@@ -10,7 +10,7 @@ The requirement is aligned with the technical case study brief delivered by the 
 
 - **Expert-Call Transcript**: A text file containing a recorded interview between an interviewer and a domain expert, with `MM:SS` timestamps at the start of each speaker turn.
 - **Interview Guide**: A fixed set of questions asked to each expert during the call. All three transcripts answer the same six-question guide.
-- **Chunk**: A single speaker turn (one continuous expert or interviewer statement) extracted from a transcript, stored with its timestamp and speaker metadata.
+- **Chunk**: A single expert speaker turn extracted from a transcript, stored with its timestamp and speaker metadata. Interviewer questions are bundled onto the following expert answer (prefixed `Q:`), so each chunk is self-contained and carries the timeframe/scope the answer depends on.
 - **Embedding**: A dense numeric vector (384-dimensions, `all-MiniLM-L6-v2`) representing the semantic meaning of a chunk's text, used for vector similarity search.
 - **Vector Store**: PostgreSQL table (`chunks`) with a `pgvector` `vector(384)` column enabling `<=>` cosine-distance search.
 - **Citation**: The source reference attached to each answer/quote — transcript filename, expert name, role, market, and timestamp(s). Every important answer must be traceable to the source transcript.
@@ -43,9 +43,10 @@ The requirement is aligned with the technical case study brief delivered by the 
 1. THE system SHALL read the six questions from `datas/Interview_Guide.txt`.
 2. For each question, and for each expert (3 experts), the system SHALL generate an answer from the expert's own transcript chunks via RAG (retrieval scoped to that expert's transcript only).
 3. Each generated answer SHALL be attached with a list of citations, each citation containing: `transcript_file`, `expert_name`, `expert_role`, `market`, `timestamp`, and the exact source `chunk_text`.
-4. THE generation prompt SHALL include a strict output contract requiring the LLM to return JSON: `{question, expert, answer, citations: [{transcript_file, expert_name, timestamp, quote}]}`.
+4. THE generation prompt SHALL include a strict output contract requiring the LLM to return JSON, answered in batches of up to 3 questions per call: `{"answers": [{"question_id": int, "answer": str, "citations": [{"transcript_file", "expert_name", "timestamp", "quote"}]}]}`.
 5. If no relevant chunk is retrieved for a question+expert, THE answer SHALL state "Not mentioned in this transcript" and include an empty citations array.
 6. Answers SHALL be generated per expert such that cross-expert contamination is prevented (retrieval is filtered by `transcript_id`).
+7. THE guide SHALL be failure-tolerant: if an LLM call for a batch fails after retries, THE system SHALL respond with a friendly generic message per question ("Oops - we hit a snag generating this one...") and empty citations, and SHALL still terminate the stream with a `done` event (a failed batch must never leave the stream unfinished).
 
 ### Requirement 3: Exact Quote Extraction (via Chat)
 
@@ -69,10 +70,11 @@ The requirement is aligned with the technical case study brief delivered by the 
 #### Acceptance Criteria
 
 1. THE system SHALL organise analysis by the six interview-guide questions (topics).
-2. For each topic, THE system SHALL retrieve the top chunks from all three experts and return a theme summary describing: consensus points, divergent points (disagreements), and differences in emphasis.
+2. For each topic, THE system SHALL retrieve the top-K most similar chunks from across all three transcripts (single cross-corpus search, chunks tagged by expert) and return a theme summary describing: consensus points, divergent points (disagreements), and differences in emphasis.
 3. Each theme entry SHALL cite the supporting experts (name, market, timestamp, quote) that back the claim.
 4. THE system SHALL distinguish between **direct disagreement** (experts state conflicting facts/numbers/timelines) and **difference in emphasis** (experts agree but weight factors differently) and label each theme accordingly.
 5. Example expected outcome: on purchase timeline (Q6), France = 6–12 months, Germany = 9–18 months, UK = 6–9 months — the theme SHALL surface this numeric range as a disagreement and cite all three timestamps.
+6. Per-topic analysis SHALL be isolated and failure-tolerant: malformed theme/citation entries are dropped (logged, never crashing the stream), and a transient LLM failure on one topic alone leaves the remaining topics unaffected; the stream SHALL always terminate with a `done` event. A failed topic SHALL be flagged as an error (`error: true` entry) so the UI can show an explicit "snag – please refresh" message, which is distinct from a successfully analysed topic that genuinely finds no themes ("No themes identified for this topic.").
 
 ### Requirement 5: Cross-Transcript Question Answering (RAG Chat)
 
@@ -82,11 +84,12 @@ The requirement is aligned with the technical case study brief delivered by the 
 
 1. THE system SHALL accept a free-text user question via API.
 2. THE system SHALL embed the question and retrieve the top-K most similar chunks (default K=5) from ALL transcripts via cosine similarity (`<=>` operator, pgvector).
-3. THE system SHALL pass only the retrieved chunks as context to the LLM, with a system prompt that: (a) forbids inventing information, (b) requires answers cite their sources by timestamp, (c) mandates "Not mentioned in the available transcripts" when no retrieved chunk is relevant.
+3. THE system SHALL pass only the retrieved chunks as context to the LLM, with a system prompt that: (a) forbids inventing information, (b) requires answers cite their sources by timestamp, (c) requires a polite "could not find it in these transcripts" response that names the covered topics when no retrieved chunk is relevant.
 4. THE answer SHALL include the list of citations used (transcript file, expert, timestamp, quote).
-5. If the question is off-topic (no relevant chunks above a similarity threshold), THE system SHALL return a graceful "not covered" response rather than guessing.
-6. When the user asks for an exact quote, THE system SHALL bypass the LLM and return verified verbatim chunks (see Requirement 3) instead of a synthesized answer.
-7. THE endpoint SHALL be stateless; question history is the responsibility of the frontend, not the backend.
+5. If the question is off-topic (no relevant chunks above a similarity threshold), THE system SHALL return a graceful, friendly "not covered" response rather than guessing.
+6. Greetings, pleasantries, and capability questions (e.g. "hi", "thank you", "what can you do?") SHALL short-circuit to a polite scope message without retrieval or LLM cost.
+7. When the user asks for an exact quote, THE system SHALL bypass the LLM and return verified verbatim chunks (see Requirement 3) instead of a synthesized answer.
+8. THE endpoint SHALL be stateless; question history is the responsibility of the frontend, not the backend.
 
 ### Requirement 6: Source Traceability and Hallucination Prevention
 
@@ -96,7 +99,7 @@ The requirement is aligned with the technical case study brief delivered by the 
 
 1. Every answer and every quote returned by the API SHALL carry at least one citation `{transcript_file, expert_name, market, timestamp, quote}`.
 2. Quote verification SHALL be performed programmatically (substring match) as the final gate before any quote is returned.
-3. THE system prompt SHALL include operational rules: "Only use the provided context. Never add information not present in the context. If the context does not answer the question, respond 'Not mentioned in the available transcripts'."
+3. THE system prompt SHALL include operational rules: "Only use the provided context. Never add information not present in the context. If the context does not answer the question, say so politely. Never answer harshly or robotically."
 4. THE LLM SHALL be configured with low temperature (0.0–0.2) for analysis and quote tasks to reduce variance/hallucination.
 5. Retrieved chunks SHALL be truncated/size-capped before prompting to prevent context overflow and to keep prompts within the token budget.
 6. THE system SHALL cache deterministic LLM results keyed by `(task, question, context-hash)` to avoid repeat cost and unstable output.
@@ -111,14 +114,44 @@ The requirement is aligned with the technical case study brief delivered by the 
 2. In "Interview Guide Answers", THE UI SHALL render each of the 6 questions, and for each expert show the generated answer with expandable citations (timestamp + quote).
 3. In "Themes & Disagreements", THE UI SHALL render a list of theme cards per topic, each labelled `Consensus` / `Disagreement` / `Emphasis`, with expert citations beneath.
 4. In "Ask a Question", THE UI SHALL provide a chat-style input; each assistant reply SHALL show the answer followed by its citations. When the user requests an exact quote, THE UI SHALL render the verbatim quote cards (transcript, expert, timestamp, quote text) instead of a synthesized answer.
-5. THE UI SHALL handle loading states (spinner during LLM calls) and display API errors gracefully without crashing.
-6. THE UI SHALL call the FastAPI backend over HTTP; no LLM or DB access from the frontend layer.
+5. THE UI SHALL handle loading states (spinner during LLM calls) and display API errors gracefully without crashing. Interview-guide answers and themes SHALL be rendered progressively from the NDJSON stream endpoints (`/interview-guide/stream`, `/themes/stream`) as batches/topics complete.
+6. THE UI SHALL render the interview-guide and themes from frontend session state once a stream completes, so a rerun (tab click, chat input, any widget interaction) never restarts the stream silently. A failed stream SHALL surface an error with an explicit Retry action instead of re-streaming on every rerun.
+7. THE UI SHALL persist the chat conversation in frontend session state; messages must remain visible across reruns, with new turns only appended when a new question is submitted.
+8. In "Ask a Question", THE UI SHALL render the message history inside a fixed-height scrollable container with the chat input pinned at the bottom, so the page does not grow and only the chat area scrolls.
+9. THE UI SHALL call the FastAPI backend over HTTP; no LLM or DB access from the frontend layer.
+
+### Requirement 8: Transcript Upload, Versioning, and Soft-Delete (Backend)
+
+**User Story:** As an operator, I want to add or replace a transcript by uploading a file (multiple at once) so the corpus is updated without shell access to the server, while older versions of a file stay hidden and the affected cached analysis is refreshed.
+
+#### Acceptance Criteria
+
+1. THE system SHALL expose `POST /api/v1/transcripts/upload` accepting multipart `.txt` files (multiple per request, max 5 MB each) and SHALL return a per-file result reporting `uploaded`, `replaced`, or `error` with a reason.
+2. THE system SHALL reject non-`.txt` files and malformed transcripts per file without failing the whole batch.
+3. Uploading a filename that already has an active transcript SHALL soft-delete the previous version (`is_active = false`) and insert a new active row with an incremented `version`; only one active version SHALL exist per filename (partial unique index on `filename WHERE is_active`).
+4. Retrieval (vector + keyword search), counts, and the transcript list SHALL consider only active transcripts, so replaced or deleted files disappear from all analysis.
+5. `GET /api/v1/transcripts` SHALL list active transcripts with their metadata and chunk counts.
+6. `DELETE /api/v1/transcripts/{id}` SHALL soft-delete a transcript (`is_active = false`), leaving chunks in storage but excluded from queries.
+7. Uploading or deleting a transcript SHALL purge the in-memory interview-guide cache for that filename so the next guide request regenerates it.
+
+### Requirement 9: Internal Traceability (Record Keeping)
+
+**User Story:** As an operator, I want the backend to keep a durable record of Q&A turns, errors, and Groq usage so I can audit what happened after the fact without trusting memory or logs.
+
+#### Acceptance Criteria
+
+1. THE system SHALL record every Q&A turn into a `chat_history` table: question, mode, answer, citations (JSON), verification status, model, and latency.
+2. THE system SHALL record every Groq call into a `llm_usage_log` table: task, model, prompt/completion/total tokens, latency, and success — so token spend is auditable per analysis feature.
+3. THE system SHALL record failures into an `error_logs` table with level, component, message, exception type, endpoint, method, and structured detail — covering Q&A errors and per-topic/batch analysis failures.
+4. Recording SHALL be best-effort: a storage failure SHALL be logged and never abort the primary request or break the streaming contract.
+5. THE system SHALL expose read endpoints `GET /api/v1/chat/history`, `GET /api/v1/error-logs`, and `GET /api/v1/llm-usage` (each with a `limit` query param).
 
 ## Out of Scope
 
 - Authentication / multi-user support (local demo tool only).
-- Persistent chat history / conversation memory on the backend.
+- Conversation memory: the backend records every Q&A turn in `chat_history` for traceability, but follow-up answers do not use prior turns — the visible conversation is owned by the frontend.
 - PDF/audio transcription support (transcripts are plain text only).
 - Deployment to cloud (local run via `make run`).
-- Operational machinery for 30+ transcript scale: file upload UI, ingestion worker with per-file status tracking, re-embedding diffs, chunk versioning, HNSW/IVFFlat index creation and tuning. The application design is scale-ready (file-driven ingestion reading all `.txt` files in `datas/`, `LIMIT top_k` retrieval, configurable constants) so that adding transcripts is additive — but the heavy ingestion/indexing tooling is deliberately out of scope for this story and explained during the demo.
+- File-manager/frontend UI for uploads (uploads are performed via `POST /api/v1/transcripts/upload`; the Streamlit UI is read-only for analysis).
+- Operational machinery for 30+ transcript scale: ingestion worker with per-file status tracking, re-embedding diffs, fine-grained chunk versioning, HNSW/IVFFlat index creation and tuning. The application design is scale-ready (file-driven ingestion reading all `.txt` files in `datas/`, `LIMIT top_k` retrieval, configurable constants) so that adding transcripts is additive — but the heavy ingestion/indexing tooling is deliberately out of scope for this story and explained during the demo.
 - Fine-tuning of any model.

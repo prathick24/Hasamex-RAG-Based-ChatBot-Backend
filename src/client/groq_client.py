@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from collections import deque
 
 import httpx
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
@@ -21,9 +22,8 @@ from src.utils.logger import logger
 
 _token_lock = asyncio.Lock()
 _last_request_at = 0.0
-_tokens_budget: float | None = None
-_tokens_limit = GROQ_TOKEN_LIMIT
-_tokens_reset_at = 0.0
+_token_window: deque[tuple[float, float]] = deque()
+_TOKEN_WINDOW_SECONDS = 60.0
 _requests_budget: float | None = None
 _requests_reset_at = 0.0
 
@@ -50,25 +50,29 @@ def _parse_seconds(value) -> float | None:
 
 
 def _update_ratelimit_from(response) -> None:
-    """Refresh token and request budgets from Groq's x-ratelimit-* headers."""
-    global _tokens_budget, _tokens_limit, _tokens_reset_at
+    """Refresh the request budget from Groq's x-ratelimit-* headers."""
     global _requests_budget, _requests_reset_at
     headers = response.headers
-    tokens_remaining = _parse_number(headers.get("x-ratelimit-remaining-tokens"))
-    tokens_limit = _parse_number(headers.get("x-ratelimit-limit-tokens"))
-    tokens_reset = _parse_seconds(headers.get("x-ratelimit-reset-tokens"))
     requests_remaining = _parse_number(headers.get("x-ratelimit-remaining-requests"))
     requests_reset = _parse_seconds(headers.get("x-ratelimit-reset-requests"))
-    if tokens_remaining is not None:
-        _tokens_budget = tokens_remaining
-    if tokens_limit is not None:
-        _tokens_limit = tokens_limit
-    if tokens_reset is not None:
-        _tokens_reset_at = time.monotonic() + tokens_reset
     if requests_remaining is not None:
         _requests_budget = requests_remaining
     if requests_reset is not None:
         _requests_reset_at = time.monotonic() + requests_reset
+
+
+def _prune_token_window() -> None:
+    """Drop token-window entries that have aged out of the rolling minute."""
+    cutoff = time.monotonic() - _TOKEN_WINDOW_SECONDS
+    while _token_window and _token_window[0][0] < cutoff:
+        _token_window.popleft()
+
+
+def _record_token_usage(total_tokens: float | None) -> None:
+    """Record actual tokens consumed in the rolling token window."""
+    if total_tokens and total_tokens > 0:
+        _token_window.append((time.monotonic(), float(total_tokens)))
+        _prune_token_window()
 
 
 class GroqClient:
@@ -81,6 +85,7 @@ class GroqClient:
             base_url=self.base_url,
             timeout=httpx.Timeout(self.timeout),
         )
+        self.usage_recorder = None
 
     @retry(
         stop=stop_after_attempt(LLM_RETRY_MAX_ATTEMPTS),
@@ -110,25 +115,31 @@ class GroqClient:
             body["response_format"] = response_format
 
         async with _token_lock:
-            global _last_request_at, _tokens_budget, _requests_budget
+            global _last_request_at, _requests_budget
             now = time.monotonic()
 
             delay = GROQ_MIN_REQUEST_INTERVAL - (now - _last_request_at)
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            if _tokens_budget is not None and _tokens_budget < GROQ_ESTIMATED_TOKENS_PER_REQUEST:
-                if now < _tokens_reset_at:
-                    await asyncio.sleep(_tokens_reset_at - now)
-                _tokens_budget = _tokens_limit
+            while True:
+                _prune_token_window()
+                if not _token_window:
+                    break
+                used = sum(total for _, total in _token_window)
+                if used + GROQ_ESTIMATED_TOKENS_PER_REQUEST <= GROQ_TOKEN_LIMIT:
+                    break
+                oldest_expiry = _token_window[0][0] + _TOKEN_WINDOW_SECONDS
+                remaining = oldest_expiry - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                else:
+                    _token_window.popleft()
 
             if _requests_budget is not None and _requests_budget <= 0:
-                if now < _requests_reset_at:
-                    await asyncio.sleep(_requests_reset_at - now)
+                if time.monotonic() < _requests_reset_at:
+                    await asyncio.sleep(_requests_reset_at - time.monotonic())
                 _requests_budget = None
-
-            if _tokens_budget is not None:
-                _tokens_budget -= GROQ_ESTIMATED_TOKENS_PER_REQUEST
 
             _last_request_at = time.monotonic()
             response = await self._client.post(
@@ -137,8 +148,20 @@ class GroqClient:
                 headers={"Authorization": f"Bearer {self.api_key}"},
             )
             _update_ratelimit_from(response)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if response.status_code < 400:
+                usage = data.get("usage") or {}
+                total_tokens = usage.get("total_tokens")
+                if total_tokens is None:
+                    total_tokens = (usage.get("prompt_tokens") or 0) + (
+                        usage.get("completion_tokens") or 0
+                    )
+                _record_token_usage(total_tokens)
         response.raise_for_status()
-        return response.json()
+        return data
 
     async def create_completion(
         self,
@@ -146,30 +169,75 @@ class GroqClient:
         temperature: float = 0.2,
         max_tokens: int = 1024,
         response_format: dict | None = None,
+        task: str | None = None,
     ) -> dict:
         if not self.api_key:
             raise LLMError("GROQ_API_KEY is not configured")
 
         payload = {"messages": messages}
+        start = time.monotonic()
         try:
             logger.info("groq_request", model=self.model, messages=len(messages))
             data = await self._post_completion(payload, temperature, max_tokens, response_format)
             content = data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
             logger.info(
                 "groq_completion",
                 model=self.model,
-                prompt_tokens=data.get("usage", {}).get("prompt_tokens"),
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                total_tokens=usage.get("total_tokens"),
             )
             if not content:
                 raise LLMParseError("Empty content returned by Groq")
+            await self._record_usage(task, usage, start, success=True)
             return {"content": content, "raw": data}
+        except LLMParseError:
+            await self._record_usage(task, data.get("usage", {}), start, success=False)
+            raise
         except httpx.HTTPStatusError as exc:
+            await self._record_usage(task, {}, start, success=False)
             raise LLMError(f"Groq request failed with status {exc.response.status_code}") from exc
         except httpx.HTTPError as exc:
+            await self._record_usage(task, {}, start, success=False)
             raise LLMError(f"Groq request failed: {exc}") from exc
 
+    async def _record_usage(
+        self,
+        task: str | None,
+        usage: dict,
+        start: float,
+        success: bool,
+    ) -> None:
+        """Best-effort: report each LLM call to the injected usage recorder."""
+        if self.usage_recorder is None:
+            return
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+        try:
+            await self.usage_recorder(
+                {
+                    "task": task,
+                    "model": self.model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "latency_ms": round((time.monotonic() - start) * 1000),
+                    "success": success,
+                }
+            )
+        except Exception:
+            logger.warning("usage_recorder_failed", exc_info=True)
+
     async def parse_json_completion(
-        self, messages: list[dict], temperature: float = 0.2, max_tokens: int = 2048
+        self,
+        messages: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 2048,
+        task: str | None = None,
     ) -> dict:
         """Request the model to return valid JSON and parse it."""
         completion = await self.create_completion(
@@ -177,6 +245,7 @@ class GroqClient:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
+            task=task,
         )
         try:
             content = completion["content"]

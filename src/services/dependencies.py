@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.client.embedder_client import EmbedderClient
 from src.client.groq_client import GroqClient
 from src.repositories.transcript_repository import TranscriptRepository
+from src.services import audit_service
 from src.settings import Settings, get_settings
 from src.utils.exceptions.exceptions import LLMError
 
@@ -22,6 +23,8 @@ def get_services() -> ServiceDependencies:
     settings = get_settings()
     embedder = EmbedderClient(settings)
     groq_client = GroqClient(settings=settings) if settings.groq_api_key else None
+    if groq_client is not None:
+        groq_client.usage_recorder = audit_service.record_llm_usage
     return ServiceDependencies(settings=settings, embedder=embedder, groq=groq_client)
 
 

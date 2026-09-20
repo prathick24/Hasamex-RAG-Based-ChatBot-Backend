@@ -173,6 +173,8 @@ async def test_ingest_maps_filename_to_transcript_id():
 
         async def execute(self, stmt, params=None):
             self.step += 1
+            if "GROUP BY" in str(stmt):
+                return FakeResult([])
             if self.step >= 4:
                 return FakeResult([1])
             return FakeResult([])
@@ -201,6 +203,75 @@ async def test_delete_all_transcripts_commits():
     repo = TranscriptRepository(session)
     await repo.delete_all_transcripts()
     assert session.committed
+
+
+async def test_get_next_version_default_one():
+    repo = TranscriptRepository(make_session(FakeResult([None])))
+    assert await repo.get_next_version("a.txt") == 1
+
+
+async def test_get_next_version_increments():
+    repo = TranscriptRepository(make_session(FakeResult([2])))
+    assert await repo.get_next_version("a.txt") == 3
+
+
+async def test_upload_version_new_file():
+    session = make_session(FakeResult([]), FakeResult([None]))
+    repo = TranscriptRepository(session)
+    transcript_id, replaced, version = await repo.upload_version(
+        {"filename": "a.txt", "expert_name": "X", "expert_role": None, "market": "M"},
+        [],
+    )
+    assert transcript_id == 1
+    assert replaced is False
+    assert version == 1
+    assert session.committed
+
+
+async def test_upload_version_replaces_active_file():
+    existing = type("T", (), {"id": 5, "is_active": True})()
+    session = make_session(FakeResult([existing]), FakeResult([1]))
+    repo = TranscriptRepository(session)
+    transcript_id, replaced, version = await repo.upload_version(
+        {"filename": "a.txt", "expert_name": "X", "expert_role": None, "market": "M"},
+        [],
+    )
+    assert transcript_id == 1
+    assert replaced is True
+    assert version == 2
+    assert existing.is_active is False
+    assert session.committed
+
+
+async def test_upload_version_stores_chunk_count():
+    session = make_session(FakeResult([]), FakeResult([None]))
+    repo = TranscriptRepository(session)
+    await repo.upload_version(
+        {"filename": "a.txt", "expert_name": "X", "expert_role": None, "market": "M"},
+        [
+            {
+                "speaker": "Expert",
+                "speaker_index": "EX_00",
+                "timestamp": "00:01",
+                "content": "hi",
+                "embedding": [0.1] * 384,
+            }
+        ],
+    )
+    assert session.added[0].chunk_count == 1
+
+
+async def test_soft_delete_transcript_active():
+    transcript = type("T", (), {"id": 9, "filename": "a.txt", "is_active": True})()
+    repo = TranscriptRepository(make_session(FakeResult([transcript])))
+    filename = await repo.soft_delete_transcript(9)
+    assert filename == "a.txt"
+    assert transcript.is_active is False
+
+
+async def test_soft_delete_transcript_missing():
+    repo = TranscriptRepository(make_session(FakeResult([])))
+    assert await repo.soft_delete_transcript(9) is None
 
 
 def _make_row(chunk_id=1, content="x"):

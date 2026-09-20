@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from src.utils.exceptions.exceptions import ValidationError
-from src.utils.parser import load_interview_guide, parse_transcript_file
+from src.utils.parser import load_interview_guide, parse_transcript_file, parse_transcript_text
 
 DATAS = Path(__file__).resolve().parent.parent.parent / "datas"
 
@@ -69,6 +69,18 @@ def test_parse_no_turns_raises(tmp_path):
     )
     with pytest.raises(ValidationError):
         parse_transcript_file(bad_file)
+
+
+def test_parse_transcript_text_matches_file_parse():
+    content = (DATAS / "Transcript_1_France.txt").read_text(encoding="utf-8", errors="replace")
+    parsed = parse_transcript_text("Transcript_1_France.txt", content)
+    assert parsed.expert_name == "Dr. Jean Martin"
+    assert parsed.expert_role == "Head of Urology"
+    assert parsed.market == "France"
+    assert parsed.filename == "Transcript_1_France.txt"
+    expert_turns = [t for t in parsed.turns if t.speaker == "Expert"]
+    assert len(expert_turns) == 7
+    assert expert_turns[0].speaker_index == "EX_00"
 
 
 def test_load_interview_guide():

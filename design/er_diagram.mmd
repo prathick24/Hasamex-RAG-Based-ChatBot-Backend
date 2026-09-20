@@ -2,11 +2,13 @@ erDiagram
 
     transcripts {
         INT id PK
-        VARCHAR_255 filename "NOT NULL UNIQUE e.g. Transcript_1_France.txt"
+        VARCHAR_255 filename "NOT NULL e.g. Transcript_1_France.txt (partial UNIQUE WHERE is_active)"
         VARCHAR_255 expert_name "NOT NULL e.g. Dr. Jean Martin"
         VARCHAR_255 expert_role "NULL e.g. Head of Urology"
         VARCHAR_100 market "NOT NULL e.g. France"
         INT chunk_count "NULL DEFAULT 0"
+        BOOLEAN is_active "NOT NULL DEFAULT TRUE (soft delete / version flag)"
+        INT version "NOT NULL DEFAULT 1 (increments per filename on re-upload)"
         TIMESTAMP ingested_at "NULL DEFAULT NOW()"
     }
 

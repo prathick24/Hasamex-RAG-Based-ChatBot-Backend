@@ -124,6 +124,117 @@ def test_ingest_error(client, monkeypatch):
     assert "cannot parse" in response.json()["detail"]
 
 
+def test_upload_transcripts_ok(client, monkeypatch):
+    from src.services import ingest_service as ing_svc
+
+    async def fake_ingest_single_file(self, filename, content):
+        return {"transcript_id": 42, "replaced": False, "version": 1, "chunk_count": 7}
+
+    monkeypatch.setattr(ing_svc.IngestService, "ingest_single_file", fake_ingest_single_file)
+    response = client.post(
+        "/api/v1/transcripts/upload",
+        files=[
+            ("files", ("a.txt", b"some content", "text/plain")),
+            ("files", ("b.txt", b"other content", "text/plain")),
+        ],
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["processed"] == 2
+    assert body["succeeded"] == 2
+    assert body["results"][0]["status"] == "uploaded"
+    assert body["results"][0]["transcript_id"] == 42
+    assert body["results"][0]["version"] == 1
+
+
+def test_upload_transcripts_replaced(client, monkeypatch):
+    from src.services import ingest_service as ing_svc
+
+    async def fake_ingest_single_file(self, filename, content):
+        return {"transcript_id": 43, "replaced": True, "version": 2, "chunk_count": 5}
+
+    monkeypatch.setattr(ing_svc.IngestService, "ingest_single_file", fake_ingest_single_file)
+    response = client.post(
+        "/api/v1/transcripts/upload",
+        files=[("files", ("a.txt", b"content", "text/plain"))],
+    )
+    body = response.json()
+    assert body["succeeded"] == 1
+    assert body["results"][0]["status"] == "replaced"
+    assert body["results"][0]["version"] == 2
+
+
+def test_upload_transcripts_non_txt_rejected(client):
+    response = client.post(
+        "/api/v1/transcripts/upload",
+        files=[("files", ("b.md", b"# note", "text/markdown"))],
+    )
+    body = response.json()
+    assert body["succeeded"] == 0
+    assert body["results"][0]["status"] == "error"
+    assert "Only .txt files" in body["results"][0]["reason"]
+
+
+def test_upload_transcripts_validation_error(client, monkeypatch):
+    from src.services import ingest_service as ing_svc
+    from src.utils.exceptions.exceptions import ValidationError
+
+    async def fake_ingest_single_file(self, filename, content):
+        raise ValidationError("Could not parse expert metadata from header")
+
+    monkeypatch.setattr(ing_svc.IngestService, "ingest_single_file", fake_ingest_single_file)
+    response = client.post(
+        "/api/v1/transcripts/upload",
+        files=[("files", ("a.txt", b"garbage", "text/plain"))],
+    )
+    body = response.json()
+    assert body["succeeded"] == 0
+    assert body["results"][0]["status"] == "error"
+    assert "Could not parse" in body["results"][0]["reason"]
+
+
+def test_list_transcripts_ok(client, monkeypatch):
+    from src.repositories.schema.schemas import TranscriptRecord
+    from src.services import ingest_service as ing_svc
+
+    async def fake_list(self):
+        return [
+            TranscriptRecord(
+                id=1, filename="a.txt", expert_name="X", expert_role=None, market="M", chunk_count=7
+            )
+        ]
+
+    monkeypatch.setattr(ing_svc.IngestService, "list_ingested", fake_list)
+    response = client.get("/api/v1/transcripts")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["transcripts"][0]["filename"] == "a.txt"
+
+
+def test_delete_transcript_ok(client, monkeypatch):
+    from src.services import ingest_service as ing_svc
+
+    async def fake_delete(self, transcript_id):
+        return True
+
+    monkeypatch.setattr(ing_svc.IngestService, "delete_transcript", fake_delete)
+    response = client.delete("/api/v1/transcripts/3")
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+
+
+def test_delete_transcript_missing(client, monkeypatch):
+    from src.services import ingest_service as ing_svc
+
+    async def fake_delete(self, transcript_id):
+        return False
+
+    monkeypatch.setattr(ing_svc.IngestService, "delete_transcript", fake_delete)
+    response = client.delete("/api/v1/transcripts/9")
+    assert response.status_code == 200
+    assert response.json()["deleted"] is False
+
+
 def test_interview_guide_ok(client, monkeypatch):
     from src.services import interview_guide_service as igs
 
@@ -228,3 +339,39 @@ def test_qa_ask_no_groq_key(client, monkeypatch):
 
 def test_detect_quote_intent_covered_in_service_tests():
     assert detect_quote_intent("what is adoption?") is False
+
+
+def test_list_chat_history_ok(client, monkeypatch):
+    from src.repositories.audit_repository import AuditRepository
+
+    async def fake_list(self, limit):
+        return [{"question": "q1", "mode": "answer", "citations": []}]
+
+    monkeypatch.setattr(AuditRepository, "list_chat_history", fake_list)
+    response = client.get("/api/v1/chat/history")
+    assert response.status_code == 200
+    assert response.json()[0]["question"] == "q1"
+
+
+def test_list_error_logs_ok(client, monkeypatch):
+    from src.repositories.audit_repository import AuditRepository
+
+    async def fake_list(self, limit):
+        return [{"component": "qa", "message": "boom"}]
+
+    monkeypatch.setattr(AuditRepository, "list_error_logs", fake_list)
+    response = client.get("/api/v1/error-logs")
+    assert response.status_code == 200
+    assert response.json()[0]["component"] == "qa"
+
+
+def test_list_llm_usage_ok(client, monkeypatch):
+    from src.repositories.audit_repository import AuditRepository
+
+    async def fake_list(self, limit):
+        return [{"task": "qa_answer", "model": "mock", "success": True}]
+
+    monkeypatch.setattr(AuditRepository, "list_llm_usage", fake_list)
+    response = client.get("/api/v1/llm-usage")
+    assert response.status_code == 200
+    assert response.json()[0]["task"] == "qa_answer"

@@ -64,12 +64,9 @@ def _parse_header(raw_lines: list[str]) -> tuple[str, str | None, str]:
     return expert_name, expert_role, market
 
 
-def parse_transcript_file(filepath: Path) -> ParsedTranscript:
-    """Parse a transcript file into a ParsedTranscript with ordered turns."""
-    if not filepath.exists():
-        raise ValidationError(f"Transcript file not found: {filepath.name}")
-
-    raw_lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
+def parse_transcript_text(filename: str, text_content: str) -> ParsedTranscript:
+    """Parse raw transcript text into a ParsedTranscript with ordered turns."""
+    raw_lines = text_content.splitlines()
     expert_name, expert_role, market = _parse_header(raw_lines)
 
     turns: list[ParsedTurn] = []
@@ -115,7 +112,7 @@ def parse_transcript_file(filepath: Path) -> ParsedTranscript:
     _flush_turn()
 
     if not turns:
-        raise ValidationError(f"No timestamped turns found in {filepath.name}")
+        raise ValidationError(f"No timestamped turns found in {filename}")
 
     interview_count = 0
     expert_count = 0
@@ -128,12 +125,21 @@ def parse_transcript_file(filepath: Path) -> ParsedTranscript:
             expert_count += 1
 
     return ParsedTranscript(
-        filename=filepath.name,
+        filename=filename,
         expert_name=expert_name,
         expert_role=expert_role,
         market=market,
         turns=turns,
     )
+
+
+def parse_transcript_file(filepath: Path) -> ParsedTranscript:
+    """Parse a transcript file into a ParsedTranscript with ordered turns."""
+    if not filepath.exists():
+        raise ValidationError(f"Transcript file not found: {filepath.name}")
+
+    text_content = filepath.read_text(encoding="utf-8", errors="replace")
+    return parse_transcript_text(filepath.name, text_content)
 
 
 def load_interview_guide(filepath: Path) -> list[str]:

@@ -59,5 +59,13 @@ def clear_cache() -> None:
     _cache.clear()
 
 
+def purge_by_prefix(prefix: str) -> int:
+    """Remove every cached entry whose key starts with prefix; returns count removed."""
+    keys = [key for key in _cache._store if key.startswith(prefix)]
+    for key in keys:
+        del _cache._store[key]
+    return len(keys)
+
+
 def cache_enabled() -> bool:
     return get_settings().cache_llm_results

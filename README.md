@@ -14,7 +14,7 @@ Streamlit frontend (frontend/app.py) ── HTTP /api/v1 ──► FastAPI backe
                                                           │
                                        ┌──────────────────┴───────────────────┐
                                        │                                      │
-                              PostgreSQL (pgvector)              Groq API (llama-3.3-70b-versatile)
+                              PostgreSQL (pgvector)              Groq API (openai/gpt-oss-120b)
                               transcripts + chunks(vector 384)   (cloud, free tier)
                                        │
                               sentence-transformers (all-MiniLM-L6-v2, local)
@@ -28,13 +28,13 @@ Layers (per project standards): Routes → Services → Repositories → Data St
 |-----------|--------|
 | Backend | FastAPI + uvicorn (Python 3.12) |
 | Frontend | Streamlit |
-| LLM | Groq API — `llama-3.3-70b-versatile` |
+| LLM | Groq API — `openai/gpt-oss-120b` |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (384-dim, local) |
 | Store | PostgreSQL 18 + pgvector (`vector(384)`, cosine) |
 | DI / ORM | SQLAlchemy 2.x async + asyncpg |
 | Config | Pydantic Settings + `.env` |
 | Logging | structlog (JSON) |
-| Retry | tenacity (Groq 429/5xx, 3 attempts, 2s→10s backoff) |
+| Retry | tenacity (Groq 429/5xx, 5 attempts, 2s→10s backoff) |
 
 ## Prerequisites
 
@@ -82,9 +82,17 @@ In another terminal, start the Streamlit UI.
 | GET | `/health` | Liveness |
 | GET | `/ready` | Readiness (DB + pgvector + tables + counts) |
 | POST | `/api/v1/transcripts` | Ingest all `.txt` transcripts in `datas/` (idempotent) |
+| POST | `/api/v1/transcripts/upload` | Upload one or more `.txt` transcripts (multipart, per-file result, versioned) |
+| GET | `/api/v1/transcripts` | List active transcripts |
+| DELETE | `/api/v1/transcripts/{id}` | Soft-delete a transcript |
 | GET | `/api/v1/analysis/interview-guide` | 6 questions × per-expert answers + citations |
+| GET | `/api/v1/analysis/interview-guide/stream` | Same guide as streaming NDJSON (`meta` → batches → `done`) |
 | GET | `/api/v1/analysis/themes` | Consensus / Disagreement / Emphasis themes |
+| GET | `/api/v1/analysis/themes/stream` | Same themes as streaming NDJSON (`meta` → topics → `done`) |
 | POST | `/api/v1/qa/ask` | Free-form Q&A (`answer`) or verbatim exact quotes (`quote`) |
+| GET | `/api/v1/chat/history` | Traceability: recent Q&A turns (`limit`) |
+| GET | `/api/v1/error-logs` | Traceability: recorded errors by component (`limit`) |
+| GET | `/api/v1/llm-usage` | Traceability: per-call Groq usage + latency (`limit`) |
 
 `POST /api/v1/qa/ask` body:
 
@@ -121,11 +129,21 @@ make test-cov       # pytest + coverage (target >80%)
 
 - **Hallucination prevention** — every LLM task has a typed JSON output contract
   validated before returning; LLM answers are grounded only in retrieved chunks;
-  all returned quotes are verified programmatically as substrings of source text;
-  unfounded answers return `"Not mentioned in the available transcripts."`
+  all returned quotes are verified programmatically as substrings of source text.
+  Questions that can't be answered from the transcripts get a friendly
+  "couldn't find that in these transcripts" reply pointing at what the interviews
+  cover; greetings/off-topic chit-chat get a polite scope message instead of a
+  robotic "not mentioned" line.
 - **Idempotent ingestion** — re-running `POST /transcripts` never duplicates rows.
+- **Versioned uploads** — `POST /transcripts/upload` replaces any file with the same
+  name: the previous version is soft-deleted (`is_active=false`), a new row is stored
+  with an incremented `version`, only active versions are retrieved, and the interview
+  guide cache for that file is purged.
 - **Caching** — deterministic LLM outputs are cached in memory (repeat requests
   cost zero Groq tokens).
+- **Traceability** — every Q&A turn, error, and Groq call is recorded
+  (`chat_history`, `error_logs`, `llm_usage_log` tables) via best-effort writes
+  that never break the primary request; read back through the three endpoints above.
 - **Scale story** — retrieval is capped (`LIMIT :top_k`). Code reads every `.txt`
   in `datas/`, so moving from 3 to 30 transcripts is just adding files; vector
   indexes (HNSW/IVFFlat) and background ingestion workers are intentionally out

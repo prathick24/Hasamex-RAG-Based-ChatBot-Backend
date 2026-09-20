@@ -55,7 +55,7 @@ class FakeGroq:
     def set_default(self, payload: dict) -> None:
         self.payloads = [payload]
 
-    async def parse_json_completion(self, messages: list[dict], temperature: float = 0.2, max_tokens: int = 2048) -> dict:
+    async def parse_json_completion(self, messages: list[dict], temperature: float = 0.2, max_tokens: int = 2048, task: str | None = None) -> dict:
         self.calls.append(messages)
         if not self.payloads:
             return {"answer": "mock answer", "citations": []}

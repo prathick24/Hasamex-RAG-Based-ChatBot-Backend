@@ -17,7 +17,7 @@ class FakeGroq:
         self._payload = payload
         self.calls = 0
 
-    async def parse_json_completion(self, messages, temperature=0.2, max_tokens=2048):
+    async def parse_json_completion(self, messages, temperature=0.2, max_tokens=2048, task=None):
         self.calls += 1
         return self._payload
 
@@ -125,3 +125,61 @@ async def test_themes_citations_verified_against_chunks():
         entries = await svc.get_themes()
     assert entries[0].themes[0].type == "Disagreement"
     assert entries[0].themes[0].citations == []
+
+
+async def test_themes_skips_non_dict_items():
+    payload = {
+        "topic": "t",
+        "themes": [
+            "just a string",
+            42,
+            {
+                "type": "Consensus",
+                "summary": "Training matters",
+                "citations": ["also badly shaped"],
+            },
+        ],
+    }
+    svc, groq = make_service(payload, chunks=[make_chunk(content="Isolated cache context")])
+    with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
+        entries = await svc.get_themes()
+    themes = entries[0].themes
+    assert len(themes) == 1
+    assert themes[0].type == "Consensus"
+    assert themes[0].summary == "Training matters"
+    assert themes[0].citations == []
+
+
+async def test_themes_yields_empty_entry_on_topic_error():
+    svc, groq = make_service({}, chunks=[make_chunk()])
+
+    async def boom(topic):
+        raise RuntimeError("boom")
+
+    svc._analyze_topic = boom
+
+    with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
+        events = [e async for e in svc.generate_themes()]
+    topics = [e for e in events if e["type"] == "topic"]
+    assert len(topics) == 6
+    assert all(e["themes"] == [] for e in topics)
+    assert all(e["error"] is True for e in topics)
+    assert events[-1]["type"] == "done"
+
+
+async def test_themes_success_entries_not_flagged_as_error():
+    payload = {
+        "topic": "t",
+        "themes": [
+            {
+                "type": "Consensus",
+                "summary": "All experts stress training",
+                "citations": [],
+            }
+        ],
+    }
+    svc, groq = make_service(payload, chunks=[make_chunk(content="Isolated success context")])
+    with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
+        entries = await svc.get_themes()
+    assert all(len(entry.themes) == 1 for entry in entries)
+    assert all(entry.error is False for entry in entries)
