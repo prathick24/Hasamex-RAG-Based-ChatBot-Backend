@@ -81,17 +81,14 @@ def render_citations(citations: list[dict]) -> None:
 
 
 def render_answer_mode(data: dict) -> None:
-    st.markdown(f"**{data['answer']}**")
+    if data.get("answer"):
+        st.markdown(f"**{data['answer']}**")
     if data.get("citations"):
         with st.expander("Sources"):
             render_citations(data["citations"])
 
 
-def render_quote_mode(data: dict) -> None:
-    quotes = data.get("quotes") or []
-    if not quotes:
-        st.info(data.get("answer") or "No exact quote found.")
-        return
+def render_quotes(quotes: list[dict]) -> None:
     for quote in quotes:
         status = quote.get("verification_status", "verified")
         icon = "\u2705" if status == "verified" else "\u26a0\ufe0f"
@@ -103,6 +100,14 @@ def render_quote_mode(data: dict) -> None:
         st.divider()
 
 
+def render_quotes_section(data: dict) -> None:
+    quotes = data.get("quotes") or []
+    if not quotes:
+        return
+    st.markdown("**Verbatim quotes:**")
+    render_quotes(quotes)
+
+
 def render_chat_message(message: dict) -> None:
     if message["role"] == "user":
         st.chat_message("user").write(message["content"])
@@ -110,12 +115,10 @@ def render_chat_message(message: dict) -> None:
     if message.get("mode") == "error":
         st.chat_message("assistant").error(message["content"])
         return
-    if message.get("mode") == "quote":
-        with st.chat_message("assistant"):
-            render_quote_mode(message["data"])
-    else:
-        with st.chat_message("assistant"):
-            render_answer_mode(message["data"])
+    with st.chat_message("assistant"):
+        data = message["data"]
+        render_answer_mode(data)
+        render_quotes_section(data)
 
 
 def render_guide_entries(entries: list[dict]) -> None:
@@ -370,9 +373,8 @@ def _render_tab(state_key: str, state_label: str, retry_key: str, stream_fn, ren
 def render_chat_tab() -> None:
     st.header("Ask a Question")
     st.caption(
-        "Free-form questions are answered with citations. "
-        "Ask for an *exact quote* (e.g. \u201cquote what Anna Keller said about barriers\u201d) "
-        "to get verbatim transcript excerpts without any AI rewriting."
+        "Every answer is the LLM's cited synthesis plus verbatim transcript "
+        "excerpts with timestamps, so you can verify it word-for-word."
     )
 
     messages = st.session_state.setdefault(CHAT_SESSION_KEY, [])

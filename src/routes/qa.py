@@ -1,11 +1,10 @@
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories.database import get_db
-from src.repositories.schema.schemas import AnswerModeResponse, QuoteModeResponse
+from src.repositories.schema.schemas import AnswerModeResponse, AskRequest
 from src.repositories.transcript_repository import TranscriptRepository
 from src.services import audit_service
 from src.services.dependencies import get_service_deps
@@ -15,22 +14,16 @@ from src.utils.exceptions.exceptions import LLMError
 router = APIRouter(prefix="/api/v1/qa", tags=["Q&A"])
 
 
-class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=500)
-    mode: str | None = Field(default=None, pattern="^(answer|quote)$")
-    top_k: int = Field(default=5, ge=1, le=20)
-
-
-@router.post("/ask", response_model=AnswerModeResponse | QuoteModeResponse)
+@router.post("/ask", response_model=AnswerModeResponse)
 async def ask(
     request: AskRequest,
     session: AsyncSession = Depends(get_db),
     dependencies=Depends(get_service_deps),
-) -> AnswerModeResponse | QuoteModeResponse:
+) -> AnswerModeResponse:
     service = QAService(TranscriptRepository(session), dependencies)
     start = time.perf_counter()
     try:
-        response = await service.ask(question=request.question, mode=request.mode, top_k=request.top_k)
+        response = await service.ask(question=request.question, top_k=request.top_k)
     except LLMError as exc:
         await audit_service.record_error(
             component="qa",

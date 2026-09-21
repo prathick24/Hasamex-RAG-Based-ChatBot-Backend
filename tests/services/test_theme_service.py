@@ -1,10 +1,22 @@
 from pathlib import Path
 from unittest import mock
 
-from src.services.theme_service import ThemeService
+from src.services.theme_service import THEME_EXPERT_TOP_K, ThemeService
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATAS = PROJECT_ROOT / "datas"
+
+
+def test_themes_messages_embed_context_once():
+    from src.prompt import build_themes_messages
+
+    marker = "UNIQUE_CONTEXT_MARKER 15 to 20 percent"
+    messages = build_themes_messages(topic="T", context=marker)
+    system = messages[0]["content"]
+    user = messages[1]["content"]
+    assert system.count(marker) == 0
+    assert user.count(marker) == 1
+    assert "RULE-205" in system
 
 
 class FakeEmbedder:
@@ -16,9 +28,11 @@ class FakeGroq:
     def __init__(self, payload) -> None:
         self._payload = payload
         self.calls = 0
+        self.max_tokens_seen = None
 
     async def parse_json_completion(self, messages, temperature=0.2, max_tokens=2048, task=None):
         self.calls += 1
+        self.max_tokens_seen = max_tokens
         return self._payload
 
 
@@ -30,10 +44,16 @@ class FakeSettings:
 
 
 class FakeRepo:
-    def __init__(self, chunks) -> None:
+    def __init__(self, chunks, transcripts=None) -> None:
         self._chunks = chunks
+        self._transcripts = transcripts or [SimpleNamespace(id=1)]
 
-    async def similarity_search(self, query_embedding, top_k, transcript_id=None, min_cosine_distance=None):
+    async def list_transcripts(self):
+        return self._transcripts
+
+    async def similarity_search(
+        self, query_embedding, top_k, transcript_id=None, min_cosine_distance=None
+    ):
         return self._chunks
 
 
@@ -42,11 +62,18 @@ class SimpleNamespace:
         self.__dict__.update(kwargs)
 
 
-def make_chunk(expert="Dr. X", market="France", content="Training is essential", timestamp="00:10"):
+def make_chunk(
+    expert="Dr. X",
+    market="France",
+    content="Training is essential",
+    timestamp="00:10",
+    chunk_id="c1",
+):
     return type(
         "C",
         (),
         {
+            "chunk_id": chunk_id,
             "content": content,
             "timestamp": timestamp,
             "expert_name": expert,
@@ -64,11 +91,19 @@ def make_service(payload, chunks=None) -> tuple[ThemeService, FakeGroq]:
     return ThemeService(repo, deps), groq
 
 
+async def collect_entries(svc) -> list[dict]:
+    entries = []
+    async for event in svc.generate_themes():
+        if event["type"] == "topic":
+            entries.append(event)
+    return entries
+
+
 async def test_themes_empty_when_no_chunks():
     svc, groq = make_service({})
-    entries = await svc.get_themes()
+    entries = await collect_entries(svc)
     assert len(entries) == 6
-    assert all(entry.themes == [] for entry in entries)
+    assert all(entry["themes"] == [] for entry in entries)
     assert groq.calls == 0
 
 
@@ -94,11 +129,12 @@ async def test_themes_parsed_and_labeled():
     }
     svc, groq = make_service(payload, chunks=[make_chunk()])
     with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
-        entries = await svc.get_themes()
-    assert entries[0].themes[0].type == "Consensus"
-    assert entries[0].themes[0].citations[0].quote == "Training is essential"
-    assert entries[0].themes[1].type == "Emphasis"
+        entries = await collect_entries(svc)
+    assert entries[0]["themes"][0]["type"] == "Consensus"
+    assert entries[0]["themes"][0]["citations"][0]["quote"] == "Training is essential"
+    assert entries[0]["themes"][1]["type"] == "Emphasis"
     assert groq.calls == 6
+    assert groq.max_tokens_seen == 4096
 
 
 async def test_themes_citations_verified_against_chunks():
@@ -122,9 +158,9 @@ async def test_themes_citations_verified_against_chunks():
     }
     svc, groq = make_service(payload, chunks=[make_chunk(content="Real content here")])
     with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
-        entries = await svc.get_themes()
-    assert entries[0].themes[0].type == "Disagreement"
-    assert entries[0].themes[0].citations == []
+        entries = await collect_entries(svc)
+    assert entries[0]["themes"][0]["type"] == "Disagreement"
+    assert entries[0]["themes"][0]["citations"] == []
 
 
 async def test_themes_skips_non_dict_items():
@@ -142,12 +178,12 @@ async def test_themes_skips_non_dict_items():
     }
     svc, groq = make_service(payload, chunks=[make_chunk(content="Isolated cache context")])
     with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
-        entries = await svc.get_themes()
-    themes = entries[0].themes
+        entries = await collect_entries(svc)
+    themes = entries[0]["themes"]
     assert len(themes) == 1
-    assert themes[0].type == "Consensus"
-    assert themes[0].summary == "Training matters"
-    assert themes[0].citations == []
+    assert themes[0]["type"] == "Consensus"
+    assert themes[0]["summary"] == "Training matters"
+    assert themes[0]["citations"] == []
 
 
 async def test_themes_yields_empty_entry_on_topic_error():
@@ -180,6 +216,41 @@ async def test_themes_success_entries_not_flagged_as_error():
     }
     svc, groq = make_service(payload, chunks=[make_chunk(content="Isolated success context")])
     with mock.patch("src.services.dependencies.get_groq_client", return_value=groq):
-        entries = await svc.get_themes()
-    assert all(len(entry.themes) == 1 for entry in entries)
-    assert all(entry.error is False for entry in entries)
+        entries = await collect_entries(svc)
+    assert all(len(entry["themes"]) == 1 for entry in entries)
+    assert all(entry["error"] is False for entry in entries)
+
+
+async def test_retrieve_topic_chunks_per_expert_without_distance_cutoff():
+    chunks_by_transcript = {
+        1: [make_chunk("Dr. X", "France", "Six to twelve months", chunk_id="a")],
+        2: [make_chunk("Anna", "Germany", "Nine to eighteen months", chunk_id="b")],
+        3: [make_chunk("Dr. E", "UK", "Six to nine months", chunk_id="c")],
+    }
+    search_calls = []
+
+    class MultiRepo(FakeRepo):
+        def __init__(self):
+            self._transcripts = [
+                SimpleNamespace(id=1),
+                SimpleNamespace(id=2),
+                SimpleNamespace(id=3),
+            ]
+
+        async def similarity_search(
+            self, query_embedding, top_k, transcript_id=None, min_cosine_distance=None
+        ):
+            search_calls.append((transcript_id, top_k, min_cosine_distance))
+            return chunks_by_transcript.get(transcript_id, [])
+
+    svc = ThemeService(
+        MultiRepo(),
+        SimpleNamespace(embedder=FakeEmbedder(), settings=FakeSettings(), groq=object()),
+    )
+    topic = "What is the typical hospital decision-making timeline?"
+    result = await svc._retrieve_topic_chunks(topic)
+
+    assert sorted(call[0] for call in search_calls) == [1, 2, 3]
+    assert all(call[1] == THEME_EXPERT_TOP_K for call in search_calls)
+    assert all(call[2] is None for call in search_calls)
+    assert {c.chunk_id for c in result} == {"a", "b", "c"}

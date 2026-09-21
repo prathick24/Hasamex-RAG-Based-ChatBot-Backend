@@ -10,11 +10,41 @@ from src.middleware import CorrelationIdMiddleware, LoggingMiddleware
 from src.repositories.database import db
 from src.routes import api as api_routes
 from src.routes.system import router as system_router
-from src.settings import get_settings
+from src.settings import Settings, get_settings
 from src.utils.exceptions.exceptions import ApplicationError
-from src.utils.logger import setup_logging
+from src.utils.logger import logger, setup_logging
 
 setup_logging()
+
+
+async def _seed_transcripts(settings: Settings) -> None:
+    """Auto-ingest datas/ on a fresh database so analysis works right after boot.
+
+    Best-effort and idempotent: skips when transcripts already exist, logs but
+    never blocks startup on failure.
+    """
+    if not settings.seed_on_startup:
+        return
+    try:
+        from src.repositories.transcript_repository import TranscriptRepository
+        from src.services.dependencies import get_service_deps
+        from src.services.ingest_service import IngestService
+
+        async with db.session() as session:
+            repository = TranscriptRepository(session)
+            if await repository.count_transcripts() > 0:
+                logger.info("startup_seed_skipped", reason="transcripts_exist")
+                return
+            dependencies = await get_service_deps()
+            service = IngestService(repository, dependencies.embedder, settings)
+            result = await service.ingest_all()
+            logger.info(
+                "startup_seed_completed",
+                transcripts=result.transcripts_count,
+                chunks=result.chunks_count,
+            )
+    except Exception:
+        logger.exception("startup_seed_failed")
 
 
 @asynccontextmanager
@@ -22,6 +52,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     db.init(settings.database_url)
     await db.create_tables()
+    await _seed_transcripts(settings)
     yield
     await db.close()
 

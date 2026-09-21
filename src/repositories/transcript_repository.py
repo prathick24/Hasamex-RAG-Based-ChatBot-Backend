@@ -70,9 +70,8 @@ class TranscriptRepository:
     async def _ensure_transcripts(self, records: list[dict]) -> tuple[dict[str, int], int]:
         """Insert transcripts; return ({filename: id}, created_count) for all (existing or new)."""
         try:
-            existing_stmt = (
-                select(Transcript.filename, Transcript.id)
-                .where(Transcript.is_active.is_(True))
+            existing_stmt = select(Transcript.filename, Transcript.id).where(
+                Transcript.is_active.is_(True)
             )
             existing = dict((await self._session.execute(existing_stmt)).all())
 
@@ -131,9 +130,7 @@ class TranscriptRepository:
     async def count_transcripts(self) -> int:
         try:
             stmt = (
-                select(func.count())
-                .select_from(Transcript)
-                .where(Transcript.is_active.is_(True))
+                select(func.count()).select_from(Transcript).where(Transcript.is_active.is_(True))
             )
             return int((await self._session.execute(stmt)).scalar_one())
         except Exception as exc:
@@ -205,23 +202,6 @@ class TranscriptRepository:
                 f"Failed to write transcript {record.get('filename')}: {exc}"
             ) from exc
 
-    async def soft_delete_transcript(self, transcript_id: int) -> str | None:
-        """Deactivate a transcript. Returns its filename, or None if not found/active."""
-        try:
-            stmt = select(Transcript).where(
-                Transcript.id == transcript_id,
-                Transcript.is_active.is_(True),
-            )
-            transcript = (await self._session.execute(stmt)).scalar_one_or_none()
-            if transcript is None:
-                return None
-            transcript.is_active = False
-            await self._session.commit()
-            return transcript.filename
-        except Exception as exc:
-            await self._session.rollback()
-            raise RepositoryError(f"Failed to delete transcript {transcript_id}") from exc
-
     async def similarity_search(
         self,
         query_embedding: list[float],
@@ -272,6 +252,65 @@ class TranscriptRepository:
             return items
         except Exception as exc:
             raise RepositoryError(f"Vector search failed: {exc}") from exc
+
+    async def question_search(
+        self,
+        query_embedding: list[float],
+        top_k: int,
+        transcript_id: int | None = None,
+        min_cosine_distance: float | None = None,
+    ) -> list[ChunkWithTranscript]:
+        """Search chunks by similarity of the interviewer question only.
+
+        Guide questions are fixed and closely match the interviewer questions,
+        so matching on the question embedding (instead of the whole Q+A blob)
+        ranks the right chunk much higher. Returns the full Q+A bundles of the
+        best-matching questions.
+        """
+        try:
+            order_expr = Chunk.question_embedding.cosine_distance(query_embedding)
+            stmt = (
+                select(
+                    Chunk,
+                    Transcript.filename,
+                    Transcript.expert_name,
+                    Transcript.market,
+                    order_expr.label("distance"),
+                )
+                .join(Transcript, Chunk.transcript_id == Transcript.id)
+                .where(Transcript.is_active.is_(True))
+                .where(Chunk.question_embedding.is_not(None))
+                .order_by(order_expr.asc())
+                .limit(top_k)
+            )
+
+            if transcript_id is not None:
+                stmt = stmt.where(Chunk.transcript_id == transcript_id)
+
+            result = await self._session.execute(stmt)
+            rows = result.all()
+
+            items = [
+                ChunkWithTranscript(
+                    chunk_id=row.Chunk.id,
+                    transcript_file=row.filename,
+                    expert_name=row.expert_name,
+                    market=row.market,
+                    timestamp=row.Chunk.timestamp,
+                    content=row.Chunk.content,
+                    distance=float(row.distance) if row.distance is not None else None,
+                )
+                for row in rows
+            ]
+            if min_cosine_distance is not None:
+                items = [
+                    item
+                    for item in items
+                    if item.distance is not None and item.distance <= min_cosine_distance
+                ]
+            return items
+        except Exception as exc:
+            raise RepositoryError(f"Question vector search failed: {exc}") from exc
 
     async def keyword_search(
         self,

@@ -34,7 +34,7 @@ Layers (per project standards): Routes → Services → Repositories → Data St
 | DI / ORM | SQLAlchemy 2.x async + asyncpg |
 | Config | Pydantic Settings + `.env` |
 | Logging | structlog (JSON) |
-| Retry | tenacity (Groq 429/5xx, 5 attempts, 2s→10s backoff) |
+| Retry | tenacity (5xx only, 5 attempts, 2s→10s); 429 handled via Groq reset headers / `Retry-After` — sleep-and-retry when <60s, `LLMRateLimitError` otherwise |
 
 ## Prerequisites
 
@@ -72,6 +72,11 @@ make run            # backend  → http://localhost:8000  (OpenAPI at /docs)
 make run-ui         # frontend → http://localhost:8501
 ```
 
+`make run` starts the API; on startup (lifespan) it auto-ingests
+`datas/*.txt` whenever the database holds no active transcripts
+(`SEED_ON_STARTUP=true`, default) — so the app is ready to use right away,
+no manual ingest endpoint needed.
+
 In another terminal, start the Streamlit UI.
 
 ## API
@@ -81,27 +86,21 @@ In another terminal, start the Streamlit UI.
 | GET | `/` | App metadata |
 | GET | `/health` | Liveness |
 | GET | `/ready` | Readiness (DB + pgvector + tables + counts) |
-| POST | `/api/v1/transcripts` | Ingest all `.txt` transcripts in `datas/` (idempotent) |
 | POST | `/api/v1/transcripts/upload` | Upload one or more `.txt` transcripts (multipart, per-file result, versioned) |
 | GET | `/api/v1/transcripts` | List active transcripts |
-| DELETE | `/api/v1/transcripts/{id}` | Soft-delete a transcript |
-| GET | `/api/v1/analysis/interview-guide` | 6 questions × per-expert answers + citations |
-| GET | `/api/v1/analysis/interview-guide/stream` | Same guide as streaming NDJSON (`meta` → batches → `done`) |
-| GET | `/api/v1/analysis/themes` | Consensus / Disagreement / Emphasis themes |
-| GET | `/api/v1/analysis/themes/stream` | Same themes as streaming NDJSON (`meta` → topics → `done`) |
-| POST | `/api/v1/qa/ask` | Free-form Q&A (`answer`) or verbatim exact quotes (`quote`) |
-| GET | `/api/v1/chat/history` | Traceability: recent Q&A turns (`limit`) |
-| GET | `/api/v1/error-logs` | Traceability: recorded errors by component (`limit`) |
-| GET | `/api/v1/llm-usage` | Traceability: per-call Groq usage + latency (`limit`) |
+| GET | `/api/v1/analysis/interview-guide/stream` | 6 questions × per-expert answers as streaming NDJSON (`meta` → batches → `done`) |
+| GET | `/api/v1/analysis/themes/stream` | Consensus / Disagreement / Emphasis themes as streaming NDJSON (`meta` → topics → `done`) |
+| POST | `/api/v1/qa/ask` | Q&A: LLM synthesis with verified citations **plus** verbatim transcript quotes |
 
 `POST /api/v1/qa/ask` body:
 
 ```json
-{"question": "What slows down adoption in Germany?", "mode": "answer", "top_k": 5}
+{"question": "What slows down adoption in Germany?", "top_k": 5}
 ```
 
-`mode` auto-detects: phrasings like *"give me the exact quote about X"* switch to
-`quote` mode, which returns verified verbatim chunks with zero LLM calls.
+Every response contains the LLM answer, its char-verified citations, **and**
+verbatim transcript excerpts (semantic + keyword retrieval, no LLM) so claims
+can be checked word-for-word. No `mode` selection needed.
 
 ## Data
 
@@ -130,11 +129,11 @@ make test-cov       # pytest + coverage (target >80%)
 - **Hallucination prevention** — every LLM task has a typed JSON output contract
   validated before returning; LLM answers are grounded only in retrieved chunks;
   all returned quotes are verified programmatically as substrings of source text.
-  Questions that can't be answered from the transcripts get a friendly
-  "couldn't find that in these transcripts" reply pointing at what the interviews
-  cover; greetings/off-topic chit-chat get a polite scope message instead of a
-  robotic "not mentioned" line.
-- **Idempotent ingestion** — re-running `POST /transcripts` never duplicates rows.
+  Questions that can't be answered from the transcripts get a warm, varied,
+  LLM-generated reply (driven by a dedicated scope system prompt) that points at
+  what the interviews cover; greetings/off-topic chit-chat get the same
+  conversational scope handling instead of a robotic canned line.
+- **Idempotent ingestion** — the startup auto-seed never duplicates rows.
 - **Versioned uploads** — `POST /transcripts/upload` replaces any file with the same
   name: the previous version is soft-deleted (`is_active=false`), a new row is stored
   with an incremented `version`, only active versions are retrieved, and the interview
@@ -143,7 +142,7 @@ make test-cov       # pytest + coverage (target >80%)
   cost zero Groq tokens).
 - **Traceability** — every Q&A turn, error, and Groq call is recorded
   (`chat_history`, `error_logs`, `llm_usage_log` tables) via best-effort writes
-  that never break the primary request; read back through the three endpoints above.
+  that never break the primary request; inspect the tables directly in Postgres.
 - **Scale story** — retrieval is capped (`LIMIT :top_k`). Code reads every `.txt`
   in `datas/`, so moving from 3 to 30 transcripts is just adding files; vector
   indexes (HNSW/IVFFlat) and background ingestion workers are intentionally out

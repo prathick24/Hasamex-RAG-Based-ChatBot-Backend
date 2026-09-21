@@ -17,7 +17,7 @@ from src.settings import (
     LLM_TIMEOUT_SECONDS,
     Settings,
 )
-from src.utils.exceptions.exceptions import LLMError, LLMParseError
+from src.utils.exceptions.exceptions import LLMError, LLMParseError, LLMRateLimitError
 from src.utils.logger import logger
 
 _token_lock = asyncio.Lock()
@@ -26,6 +26,10 @@ _token_window: deque[tuple[float, float]] = deque()
 _TOKEN_WINDOW_SECONDS = 60.0
 _requests_budget: float | None = None
 _requests_reset_at = 0.0
+_tokens_budget: float | None = None
+_tokens_reset_at = 0.0
+_MAX_RATE_LIMIT_WAIT_SECONDS = 60.0
+_MAX_429_RETRIES = 2
 
 
 def _parse_number(value) -> float | None:
@@ -50,15 +54,48 @@ def _parse_seconds(value) -> float | None:
 
 
 def _update_ratelimit_from(response) -> None:
-    """Refresh the request budget from Groq's x-ratelimit-* headers."""
-    global _requests_budget, _requests_reset_at
+    """Refresh the request and token budgets from Groq's x-ratelimit-* headers."""
+    global _requests_budget, _requests_reset_at, _tokens_budget, _tokens_reset_at
     headers = response.headers
     requests_remaining = _parse_number(headers.get("x-ratelimit-remaining-requests"))
     requests_reset = _parse_seconds(headers.get("x-ratelimit-reset-requests"))
+    tokens_remaining = _parse_number(headers.get("x-ratelimit-remaining-tokens"))
+    tokens_reset = _parse_seconds(headers.get("x-ratelimit-reset-tokens"))
     if requests_remaining is not None:
         _requests_budget = requests_remaining
     if requests_reset is not None:
         _requests_reset_at = time.monotonic() + requests_reset
+    if tokens_remaining is not None:
+        _tokens_budget = tokens_remaining
+    if tokens_reset is not None:
+        _tokens_reset_at = time.monotonic() + tokens_reset
+
+
+def _retry_after_seconds(response) -> float | None:
+    """Service-defined wait before retrying a rate-limited request.
+
+    Considers Retry-After and the token/request reset headers; returns the
+    longest wait so the retry truly has headroom.
+    """
+    headers = response.headers
+    candidates: list[float] = []
+
+    retry_after = headers.get("retry-after")
+    if retry_after:
+        parsed = _parse_seconds(retry_after)
+        if parsed is None:
+            match = re.search(r"\d+(?:\.\d+)?", str(retry_after))
+            if match:
+                parsed = float(match.group())
+        if parsed is not None and parsed > 0:
+            candidates.append(parsed)
+
+    for name in ("x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        value = _parse_seconds(headers.get(name))
+        if value is not None and value > 0:
+            candidates.append(value)
+
+    return max(candidates) if candidates else None
 
 
 def _prune_token_window() -> None:
@@ -115,7 +152,7 @@ class GroqClient:
             body["response_format"] = response_format
 
         async with _token_lock:
-            global _last_request_at, _requests_budget
+            global _last_request_at, _requests_budget, _tokens_budget
             now = time.monotonic()
 
             delay = GROQ_MIN_REQUEST_INTERVAL - (now - _last_request_at)
@@ -141,13 +178,36 @@ class GroqClient:
                     await asyncio.sleep(_requests_reset_at - time.monotonic())
                 _requests_budget = None
 
+            if _tokens_budget is not None and _tokens_budget <= 0:
+                if time.monotonic() < _tokens_reset_at:
+                    await asyncio.sleep(_tokens_reset_at - time.monotonic())
+                _tokens_budget = None
+
             _last_request_at = time.monotonic()
-            response = await self._client.post(
-                "/chat/completions",
-                json=body,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
-            _update_ratelimit_from(response)
+            for _attempt in range(_MAX_429_RETRIES):
+                response = await self._client.post(
+                    "/chat/completions",
+                    json=body,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                _update_ratelimit_from(response)
+                if response.status_code != 429:
+                    break
+                wait = _retry_after_seconds(response)
+                if wait is None or wait >= _MAX_RATE_LIMIT_WAIT_SECONDS:
+                    raise LLMRateLimitError(
+                        "Groq rate limit reached"
+                        + (f"; retry allowed in {wait:.0f}s" if wait is not None else "")
+                    )
+                logger.warning(
+                    "groq_rate_limited_sleeping",
+                    wait_seconds=round(wait, 1),
+                    attempt=_attempt + 1,
+                )
+                await asyncio.sleep(wait + 0.5)
+            else:
+                raise LLMRateLimitError("Groq rate limit reached; retry allowed shortly")
+
             try:
                 data = response.json()
             except ValueError:
@@ -192,6 +252,9 @@ class GroqClient:
                 raise LLMParseError("Empty content returned by Groq")
             await self._record_usage(task, usage, start, success=True)
             return {"content": content, "raw": data}
+        except LLMRateLimitError:
+            await self._record_usage(task, {}, start, success=False)
+            raise
         except LLMParseError:
             await self._record_usage(task, data.get("usage", {}), start, success=False)
             raise
@@ -239,22 +302,35 @@ class GroqClient:
         max_tokens: int = 2048,
         task: str | None = None,
     ) -> dict:
-        """Request the model to return valid JSON and parse it."""
-        completion = await self.create_completion(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            task=task,
-        )
-        try:
-            content = completion["content"]
-            parsed = json.loads(content)
-            if not isinstance(parsed, dict):
-                raise LLMParseError("Groq returned non-object JSON")
-            return parsed
-        except json.JSONDecodeError as exc:
-            raise LLMParseError(f"Failed to parse Groq JSON response: {exc}") from exc
+        """Request the model to return valid JSON and parse it.
+
+        Providers occasionally emit slightly malformed JSON even in JSON mode
+        (a stray comma, a markdown fence). Retry once with the same prompts
+        before giving up so a transient slip does not fail an entire topic.
+        """
+        last_error = None
+        for _attempt in range(2):
+            completion = await self.create_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                task=task,
+            )
+            try:
+                content = completion["content"].strip()
+                if content.startswith("```"):
+                    content = content.strip("`")
+                    if content.startswith("json"):
+                        content = content[4:].lstrip()
+                parsed = json.loads(content)
+                if not isinstance(parsed, dict):
+                    raise LLMParseError("LLM returned non-object JSON")
+                return parsed
+            except (json.JSONDecodeError, LLMParseError) as exc:
+                last_error = exc
+                logger.warning("llm_json_retry", task=task, attempt=_attempt + 1)
+        raise LLMParseError(f"Failed to parse LLM JSON response after retry: {last_error}")
 
     async def close(self) -> None:
         await self._client.aclose()

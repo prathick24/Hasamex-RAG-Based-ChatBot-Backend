@@ -2,18 +2,7 @@ import pytest
 
 from src.models import ChatHistory, ErrorLog, LLMUsageLog
 from src.repositories.audit_repository import AuditRepository
-from src.utils.exceptions.exceptions import DatabaseWriteError, RepositoryError
-
-
-class FakeResult:
-    def __init__(self, rows) -> None:
-        self._rows = rows
-
-    def scalars(self):
-        return iter(self._rows)
-
-    def scalar_one_or_none(self):
-        return self._rows[0] if self._rows else None
+from src.utils.exceptions.exceptions import DatabaseWriteError
 
 
 class FakeSession:
@@ -22,11 +11,6 @@ class FakeSession:
         self.added = []
         self.committed = False
         self.rolled_back = False
-
-    async def execute(self, stmt, params=None):
-        if self._queue:
-            return self._queue.pop(0)
-        return FakeResult([])
 
     def add(self, obj):
         self.added.append(obj)
@@ -113,35 +97,6 @@ async def test_add_llm_usage():
     assert row.success is True
 
 
-async def test_list_chat_history():
-    rows = [
-        ChatHistory(question="q1", mode="answer", answer="a1", citations=[]),
-        ChatHistory(question="q2", mode="quote", answer=None, citations=[]),
-    ]
-    repository = AuditRepository(make_session(FakeResult(rows)))
-    out = await repository.list_chat_history(limit=2)
-    assert len(out) == 2
-    assert out[0]["question"] == "q1"
-    assert out[0]["citations"] == []
-    assert out[1]["mode"] == "quote"
-
-
-async def test_list_error_logs():
-    rows = [ErrorLog(level="error", component="themes", message="boom")]
-    repository = AuditRepository(make_session(FakeResult(rows)))
-    out = await repository.list_error_logs(limit=5)
-    assert out[0]["component"] == "themes"
-    assert out[0]["message"] == "boom"
-
-
-async def test_list_llm_usage():
-    rows = [LLMUsageLog(task="themes", model="mock-model", success=False)]
-    repository = AuditRepository(make_session(FakeResult(rows)))
-    out = await repository.list_llm_usage(limit=5)
-    assert out[0]["task"] == "themes"
-    assert out[0]["success"] is False
-
-
 async def test_add_raises_database_write_error():
     class BoomSession:
         def add(self, obj):
@@ -153,13 +108,3 @@ async def test_add_raises_database_write_error():
     repository = AuditRepository(BoomSession())
     with pytest.raises(DatabaseWriteError):
         await repository.add_chat_turn(question="q", mode="answer")
-
-
-async def test_list_raises_repository_error():
-    class BoomExecute:
-        async def execute(self, stmt, params=None):
-            raise RuntimeError("query failed")
-
-    repository = AuditRepository(BoomExecute())
-    with pytest.raises(RepositoryError):
-        await repository.list_error_logs(limit=5)

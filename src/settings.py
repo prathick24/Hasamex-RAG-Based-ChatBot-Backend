@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     transcript_dir: str = DEFAULT_TRANSCRIPT_DIR
     log_level: str = "INFO"
     cache_llm_results: bool = True
+    seed_on_startup: bool = True
 
 
 @lru_cache

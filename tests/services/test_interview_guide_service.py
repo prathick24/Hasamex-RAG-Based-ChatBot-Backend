@@ -69,6 +69,11 @@ class FakeRepo:
     ):
         return self._chunks
 
+    async def question_search(
+        self, query_embedding, top_k, transcript_id=None, min_cosine_distance=None
+    ):
+        return self._chunks
+
 
 def make_chunk(content="Training matters a lot", timestamp="00:10"):
     return type(
@@ -112,6 +117,25 @@ class SimpleNamespace:
         self.__dict__.update(kwargs)
 
 
+async def collect_entries(svc) -> list[dict]:
+    questions: list[dict] = []
+    answers_by_q: dict[int, list[dict]] = {}
+    async for event in svc.generate_interview_guide():
+        if event["type"] == "meta":
+            questions = event["questions"]
+        elif event["type"] == "batch":
+            for answer in event["answers"]:
+                answers_by_q.setdefault(answer["question_id"], []).append(answer)
+    return [
+        {
+            "question_id": question["question_id"],
+            "question": question["question"],
+            "answers": answers_by_q.get(question["question_id"], []),
+        }
+        for question in questions
+    ]
+
+
 async def test_interview_guide_generates_answers(monkeypatch):
     chunk = make_chunk(content="Adoption is concentrated in academic hospitals and private centres")
     citation = {
@@ -126,13 +150,13 @@ async def test_interview_guide_generates_answers(monkeypatch):
     )
     monkeypatch.setattr("src.services.dependencies.get_groq_client", lambda: groq)
 
-    entries = await svc.get_interview_guide()
+    entries = await collect_entries(svc)
     assert len(entries) == 6
-    assert entries[0].question_id == 1
-    answer = entries[0].answers[0]
-    assert "Adoption is concentrated" in answer.answer
-    assert len(answer.citations) == 1
-    assert answer.citations[0].quote == "concentrated in academic hospitals"
+    assert entries[0]["question_id"] == 1
+    answer = entries[0]["answers"][0]
+    assert "Adoption is concentrated" in answer["answer"]
+    assert len(answer["citations"]) == 1
+    assert answer["citations"][0]["quote"] == "concentrated in academic hospitals"
     assert groq.calls == 2  # 6 questions batched by 3
 
 
@@ -140,10 +164,10 @@ async def test_interview_guide_not_mentioned_when_no_chunks(monkeypatch):
     svc, groq = make_service("unused", chunks=[])
     monkeypatch.setattr("src.services.dependencies.get_groq_client", lambda: groq)
 
-    entries = await svc.get_interview_guide()
+    entries = await collect_entries(svc)
     for entry in entries:
-        assert entry.answers[0].answer == "Not mentioned in this transcript"
-        assert entry.answers[0].citations == []
+        assert entry["answers"][0]["answer"] == "Not mentioned in this transcript"
+        assert entry["answers"][0]["citations"] == []
     assert groq.calls == 0
 
 
@@ -161,8 +185,8 @@ async def test_interview_guide_fabricated_citations_dropped(monkeypatch):
     )
     monkeypatch.setattr("src.services.dependencies.get_groq_client", lambda: groq)
 
-    entries = await svc.get_interview_guide()
-    assert entries[0].answers[0].citations == []
+    entries = await collect_entries(svc)
+    assert entries[0]["answers"][0]["citations"] == []
 
 
 async def test_guide_skips_non_dict_answers(monkeypatch):
@@ -171,7 +195,9 @@ async def test_guide_skips_non_dict_answers(monkeypatch):
     class Malformed:
         calls = 0
 
-        async def parse_json_completion(self, messages, temperature=0.2, max_tokens=2048, task=None):
+        async def parse_json_completion(
+            self, messages, temperature=0.2, max_tokens=2048, task=None
+        ):
             self.calls += 1
             return {
                 "answers": [
@@ -184,9 +210,9 @@ async def test_guide_skips_non_dict_answers(monkeypatch):
     malformed = Malformed()
     monkeypatch.setattr("src.services.dependencies.get_groq_client", lambda: malformed)
 
-    entries = await svc.get_interview_guide()
-    assert entries[0].answers[0].answer == "Not mentioned in this transcript"
-    assert "valid answer text" in entries[1].answers[0].answer
+    entries = await collect_entries(svc)
+    assert entries[0]["answers"][0]["answer"] == "Not mentioned in this transcript"
+    assert "valid answer text" in entries[1]["answers"][0]["answer"]
     assert malformed.calls == 2  # 6 questions → 2 batches of 3
 
 

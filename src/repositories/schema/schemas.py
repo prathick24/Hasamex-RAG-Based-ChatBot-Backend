@@ -70,21 +70,11 @@ class TranscriptListResult(BaseModel):
     transcripts: list[TranscriptRecord] = Field(default_factory=list)
 
 
-class DeleteTranscriptResult(BaseModel):
-    deleted: bool
-
-
 class InterviewGuideAnswer(BaseModel):
     question_id: int
     expert: str
     answer: str
     citations: list[Citation] = Field(default_factory=list)
-
-
-class InterviewGuideEntry(BaseModel):
-    question_id: int
-    question: str
-    answers: list[InterviewGuideAnswer]
 
 
 class Theme(BaseModel):
@@ -99,13 +89,6 @@ class ThemeEntry(BaseModel):
     error: bool = False
 
 
-class AnswerModeResponse(BaseModel):
-    question: str
-    mode: str = "answer"
-    answer: str
-    citations: list[Citation] = Field(default_factory=list)
-
-
 class QuoteResponseItem(BaseModel):
     quote: str
     transcript_file: str
@@ -115,9 +98,14 @@ class QuoteResponseItem(BaseModel):
     verification_status: str
 
 
-class QuoteModeResponse(BaseModel):
+class AnswerModeResponse(BaseModel):
     question: str
-    mode: str = "quote"
-    answer: str | None = None
-    quotes: list[QuoteResponseItem] = Field(default_factory=list)
+    mode: str = "answer"
+    answer: str
     citations: list[Citation] = Field(default_factory=list)
+    quotes: list[QuoteResponseItem] = Field(default_factory=list)
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=20)

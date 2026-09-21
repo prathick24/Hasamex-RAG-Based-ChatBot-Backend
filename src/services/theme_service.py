@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 from src.prompt import build_themes_messages
-from src.repositories.schema.schemas import Theme, ThemeEntry
+from src.repositories.schema.schemas import ChunkWithTranscript, Theme, ThemeEntry
 from src.repositories.transcript_repository import TranscriptRepository
 from src.services import audit_service
 from src.services.cache import acached_result, make_cache_key
@@ -16,6 +16,8 @@ from src.utils.parser import load_interview_guide
 
 logger = logging.getLogger("hasamex.themes")
 
+THEME_EXPERT_TOP_K = 6
+
 
 class ThemeService:
     def __init__(self, repository: TranscriptRepository, dependencies) -> None:
@@ -23,14 +25,28 @@ class ThemeService:
         self._deps = dependencies
         self._settings: Settings = dependencies.settings
 
-    async def _retrieve_topic_chunks(self, topic: str, top_k: int = 3, per_expert: bool = True):
+    async def _retrieve_topic_chunks(self, topic: str) -> list[ChunkWithTranscript]:
+        """Per-expert retrieval: the top-K chunks scoped to each expert's
+        transcript (no distance cutoff), then merged by chunk id.
+
+        A single global top-K can silently drop a topic's chunks from one or
+        more experts. On the real corpus the purchase-timeline topic ranked each
+        expert's timeline chunk as low as 6th against the roundabout guide
+        sentence, so the guarantee is top-6 per expert (bounded context, worst
+        case 3 experts x 6). Relevance filtering is left to the LLM's RULE-204.
+        """
         query_embedding = self._deps.embedder.embed_one(topic)
-        chunks = await self._repository.similarity_search(
-            query_embedding=query_embedding,
-            top_k=top_k,
-            min_cosine_distance=self._settings.similarity_threshold,
-        )
-        return chunks
+        transcripts = await self._repository.list_transcripts()
+        merged: dict[int, ChunkWithTranscript] = {}
+        for transcript in transcripts:
+            chunks = await self._repository.similarity_search(
+                query_embedding=query_embedding,
+                top_k=THEME_EXPERT_TOP_K,
+                transcript_id=transcript.id,
+            )
+            for chunk in chunks:
+                merged[chunk.chunk_id] = chunk
+        return list(merged.values())
 
     def _tagged_context(self, chunks) -> str:
         """Serialize chunks into a context block tagged with expert identity."""
@@ -50,7 +66,7 @@ class ThemeService:
             groq = get_groq_client()
             messages = build_themes_messages(topic=topic, context=context)
             return await groq.parse_json_completion(
-                messages, temperature=0.2, task="themes"
+                messages, temperature=0.2, max_tokens=4096, task="themes"
             )
 
         payload = await acached_result(cache_key, _produce)
@@ -115,17 +131,3 @@ class ThemeService:
             }
 
         yield {"type": "done"}
-
-    async def get_themes(self) -> list[ThemeEntry]:
-        entries = []
-        async for event in self.generate_themes():
-            if event["type"] != "topic":
-                continue
-            entries.append(
-                ThemeEntry(
-                    topic=event["topic"],
-                    themes=[Theme(**theme) for theme in event["themes"]],
-                    error=event.get("error", False),
-                )
-            )
-        return entries

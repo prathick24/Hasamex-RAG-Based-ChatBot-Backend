@@ -18,8 +18,9 @@ erDiagram
         VARCHAR_50 speaker "NOT NULL CHECK (Interviewer, Expert)"
         VARCHAR_10 speaker_index "NOT NULL e.g. IN_00, EX_01 (call order)"
         VARCHAR_10 timestamp "NOT NULL e.g. 00:18"
-        TEXT content "NOT NULL"
-        VECTOR_384 embedding "NOT NULL pgvector cosine"
+        TEXT content "NOT NULL bundled Q: question + A: answer"
+        VECTOR_384 embedding "NOT NULL pgvector cosine (bundled Q+A text)"
+        VECTOR_384 question_embedding "NOT NULL pgvector cosine (interviewer question only - guide Q<->Q matching)"
         TIMESTAMP created_at "NULL DEFAULT NOW()"
     }
 

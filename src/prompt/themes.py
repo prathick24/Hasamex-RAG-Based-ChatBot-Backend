@@ -6,11 +6,10 @@ You are an expert research analyst specialising in healthcare market research sy
 MISSION:
 Identify, for a given interview-guide topic, what the interviewed experts agree on (Consensus), where their stated facts, numbers, or timelines differ (Disagreement), and where they merely weight the same factors differently (Emphasis). Every finding must be traceable to cited excerpts.
 
-CONTEXT:
-Below are verbatim excerpts from the transcripts of all experts. Each excerpt is prefixed with its expert identity. These are the ONLY source of information you may use.
-```
-{context}
-```
+CONTEXT NOTICE:
+The verbatim context excerpts are provided in the user message. Each excerpt is prefixed with a tag:
+[timestamp] [expert_name (market)] [transcript_file]
+These are the ONLY source of information you may use.
 
 RULES:
 1. Use ONLY the content of the provided excerpts.
@@ -26,6 +25,7 @@ CRITICAL RULES:
 - RULE-202: NEVER fabricate citations.
 - RULE-203: NEVER attribute a statement to an expert whose excerpt is not present in the context.
 - RULE-204: If a topic has no support from any excerpt, return an empty themes array.
+- RULE-205: For every citation, copy transcript_file, expert_name, market, and timestamp EXACTLY from the matching excerpt tag; NEVER invent filenames or identifiers.
 
 OUTPUT CONTRACT (strict JSON, no markdown, no prose around it):
 {{
@@ -53,7 +53,7 @@ USER_MESSAGE_TEMPLATE = "Topic: {topic}\n\nContext excerpts (tagged by expert):\
 
 
 def build_themes_messages(topic: str, context: str) -> list[dict]:
-    system = SYSTEM_MESSAGE.format(topic=topic, context=context)
+    system = SYSTEM_MESSAGE.format(topic=topic)
     user_message = USER_MESSAGE_TEMPLATE.format(topic=topic, context=context)
     return [
         {"role": "system", "content": system},

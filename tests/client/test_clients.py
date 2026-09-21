@@ -3,10 +3,27 @@ import json
 import httpx
 import pytest
 
+import src.client.groq_client as gc_module
 from src.client.embedder_client import EmbedderClient
 from src.client.groq_client import GroqClient
 from src.settings import Settings
-from src.utils.exceptions.exceptions import EmbeddingError, LLMError, LLMParseError
+from src.utils.exceptions.exceptions import (
+    EmbeddingError,
+    LLMError,
+    LLMParseError,
+    LLMRateLimitError,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_ratelimit_state():
+    gc_module._last_request_at = 0.0
+    gc_module._requests_budget = None
+    gc_module._requests_reset_at = 0.0
+    gc_module._tokens_budget = None
+    gc_module._tokens_reset_at = 0.0
+    gc_module._token_window.clear()
+    yield
 
 
 def make_settings(api_key="test-key", model="mock-llm"):
@@ -95,31 +112,73 @@ async def test_parse_json_completion_valid():
 
 async def test_parse_json_completion_invalid_json():
     client = GroqClient(make_settings())
-    client._client = _client_with([_ok_response("this is not json")])
+    client._client = _client_with([_ok_response("this is not json"), _ok_response("still not json")])
     with pytest.raises(LLMParseError):
         await client.parse_json_completion(messages=[])
 
 
 async def test_parse_json_completion_empty_content():
     client = GroqClient(make_settings())
-    client._client = _client_with([_ok_response("")])
+    client._client = _client_with([_ok_response(""), _ok_response("")])
     with pytest.raises(LLMParseError):
         await client.parse_json_completion(messages=[])
 
 
 async def test_parse_json_completion_non_object():
     client = GroqClient(make_settings())
-    client._client = _client_with([_ok_response("[1,2,3]")])
+    client._client = _client_with([_ok_response("[1,2,3]"), _ok_response("[4,5,6]")])
     with pytest.raises(LLMParseError):
         await client.parse_json_completion(messages=[])
 
 
-async def test_parse_json_completion_retries_then_raises():
+async def test_parse_json_completion_rate_limit_raises_without_reset_header():
     client = GroqClient(make_settings())
     responses = [_status_response(429)] * 5
     client._client = _client_with(responses)
-    with pytest.raises(LLMError):
+    with pytest.raises(LLMRateLimitError):
         await client.parse_json_completion(messages=[])
+    assert client._client._transport.request_count == 1
+
+
+async def test_rate_limit_long_reset_raises_immediately():
+    client = GroqClient(make_settings())
+    throttled = httpx.Response(429, json={}, headers={"x-ratelimit-reset-tokens": "120s"})
+    client._client = _client_with([throttled])
+    with pytest.raises(LLMRateLimitError):
+        await client.create_completion(messages=[{"role": "user", "content": "hi"}])
+    assert client._client._transport.request_count == 1
+
+
+async def test_create_completion_retries_after_short_rate_limit_reset():
+    client = GroqClient(make_settings())
+    throttled = httpx.Response(
+        429,
+        json={},
+        headers={"x-ratelimit-reset-tokens": "1.0s", "x-ratelimit-remaining-tokens": "0"},
+    )
+    client._client = _client_with([throttled, _ok_response("the answer")])
+    result = await client.create_completion(messages=[{"role": "user", "content": "hi"}])
+    assert result["content"] == "the answer"
+    assert client._client._transport.request_count == 2
+
+
+async def test_rate_limit_token_headers_tracked():
+    client = GroqClient(make_settings())
+    ok = httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": "the answer"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        },
+        headers={
+            "x-ratelimit-remaining-tokens": "670",
+            "x-ratelimit-reset-tokens": "12.0s",
+        },
+    )
+    client._client = _client_with([ok])
+    await client.create_completion(messages=[{"role": "user", "content": "hi"}])
+    assert gc_module._tokens_budget == 670
+    assert gc_module._tokens_reset_at > 0
 
 
 async def test_create_completion_records_usage_on_success():

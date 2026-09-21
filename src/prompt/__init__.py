@@ -3,7 +3,7 @@ from src.prompt.interview_guide import (
     build_interview_guide_batch_messages,
     build_interview_guide_messages,
 )
-from src.prompt.qa import build_qa_answer_messages
+from src.prompt.qa import build_qa_answer_messages, build_scope_messages
 from src.prompt.themes import build_themes_messages
 
 __all__ = [
@@ -11,5 +11,6 @@ __all__ = [
     "build_interview_guide_batch_messages",
     "build_interview_guide_messages",
     "build_qa_answer_messages",
+    "build_scope_messages",
     "build_themes_messages",
 ]

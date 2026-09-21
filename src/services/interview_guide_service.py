@@ -4,7 +4,6 @@ from pathlib import Path
 from src.prompt import build_interview_guide_batch_messages
 from src.repositories.schema.schemas import (
     InterviewGuideAnswer,
-    InterviewGuideEntry,
 )
 from src.repositories.transcript_repository import TranscriptRepository
 from src.services import audit_service
@@ -29,13 +28,21 @@ class InterviewGuideService:
         self._deps = dependencies
         self._settings: Settings = dependencies.settings
 
-    async def _retrieve_expert_chunks(self, transcript_id: int, question: str, top_k: int = 3):
+    async def _retrieve_expert_chunks(self, transcript_id: int, question: str, top_k: int = 2):
+        """Retrieve the Q+A chunks whose interviewer question best matches the
+        guide question.
+
+        The guide questions are fixed, so question-to-question matching is far
+        tighter and more reliable than matching against the whole Q+A blob.
+        No distance cutoff: the LLM filters relevance; a missing match must not
+        silently turn into "Not mentioned" (the old 0.5 cutoff dropped chunks
+        that ranked 4th+ and produced false negatives).
+        """
         query_embedding = self._deps.embedder.embed_one(question)
-        return await self._repository.similarity_search(
+        return await self._repository.question_search(
             query_embedding=query_embedding,
             top_k=top_k,
             transcript_id=transcript_id,
-            min_cosine_distance=self._settings.similarity_threshold,
         )
 
     async def _answer_expert_batch(
@@ -92,6 +99,7 @@ class InterviewGuideService:
                     await groq.parse_json_completion(
                         messages,
                         temperature=0.2,
+                        max_tokens=4096,
                         task="guide_batch",
                     ),
                     transcript.filename,
@@ -159,8 +167,7 @@ class InterviewGuideService:
                     await audit_service.record_error(
                         component="guide",
                         message=(
-                            "Interview guide batch failed for expert: "
-                            f"{transcript.expert_name}"
+                            f"Interview guide batch failed for expert: {transcript.expert_name}"
                         ),
                         exception_type=type(exc).__name__,
                         endpoint="/api/v1/analysis/interview-guide/stream",
@@ -186,25 +193,3 @@ class InterviewGuideService:
                 }
 
         yield {"type": "done"}
-
-    async def get_interview_guide(self) -> list[InterviewGuideEntry]:
-        guide_path = Path(self._settings.transcript_dir) / "Interview_Guide.txt"
-        questions = load_interview_guide(guide_path)
-        by_question: dict[int, list[InterviewGuideAnswer]] = {}
-
-        async for event in self.generate_interview_guide():
-            if event["type"] != "batch":
-                continue
-            for answer in event["answers"]:
-                by_question.setdefault(answer["question_id"], []).append(
-                    InterviewGuideAnswer(**answer)
-                )
-
-        return [
-            InterviewGuideEntry(
-                question_id=qid,
-                question=question,
-                answers=by_question.get(qid, []),
-            )
-            for qid, question in enumerate(questions, start=1)
-        ]

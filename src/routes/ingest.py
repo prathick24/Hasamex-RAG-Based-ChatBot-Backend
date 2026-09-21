@@ -1,40 +1,23 @@
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories.database import get_db
 from src.repositories.schema.schemas import (
-    DeleteTranscriptResult,
-    IngestionResult,
     TranscriptListResult,
     UploadBatchResult,
     UploadFileResult,
 )
 from src.services.dependencies import get_embedder_client, get_settings_config
 from src.services.ingest_service import IngestService
-from src.utils.exceptions.exceptions import IngestionError, ValidationError
+from src.utils.exceptions.exceptions import ValidationError
 
 logger = logging.getLogger("hasamex.ingest")
 
 router = APIRouter(prefix="/api/v1", tags=["Transcripts"])
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-
-
-@router.post("/transcripts", response_model=IngestionResult)
-async def ingest_transcripts(
-    session: AsyncSession = Depends(get_db),
-    embedder=Depends(get_embedder_client),
-    settings=Depends(get_settings_config),
-) -> IngestionResult:
-    from src.repositories.transcript_repository import TranscriptRepository
-
-    service = IngestService(TranscriptRepository(session), embedder, settings)
-    try:
-        return await service.ingest_all()
-    except IngestionError as exc:
-        raise HTTPException(status_code=500, detail=exc.message) from exc
 
 
 @router.post("/transcripts/upload", response_model=UploadBatchResult)
@@ -105,21 +88,3 @@ async def list_transcripts(
 
     service = IngestService(TranscriptRepository(session), embedder, settings)
     return TranscriptListResult(transcripts=await service.list_ingested())
-
-
-@router.delete("/transcripts/{transcript_id}", response_model=DeleteTranscriptResult)
-async def delete_transcript(
-    transcript_id: int,
-    session: AsyncSession = Depends(get_db),
-    embedder=Depends(get_embedder_client),
-    settings=Depends(get_settings_config),
-) -> DeleteTranscriptResult:
-    from src.repositories.transcript_repository import TranscriptRepository
-
-    service = IngestService(TranscriptRepository(session), embedder, settings)
-    try:
-        deleted = await service.delete_transcript(transcript_id)
-    except Exception as exc:
-        logger.exception("delete_transcript_failed id=%s", transcript_id)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return DeleteTranscriptResult(deleted=deleted)

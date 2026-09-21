@@ -1,12 +1,11 @@
 from src.repositories.schema.schemas import (
     AnswerModeResponse,
+    AskRequest,
     ChunkRecord,
     ChunkWithTranscript,
     Citation,
     IngestionResult,
     InterviewGuideAnswer,
-    InterviewGuideEntry,
-    QuoteModeResponse,
     QuoteResponseItem,
     Theme,
     ThemeEntry,
@@ -15,13 +14,12 @@ from src.repositories.schema.schemas import (
 
 __all__ = [
     "AnswerModeResponse",
+    "AskRequest",
     "ChunkRecord",
     "ChunkWithTranscript",
     "Citation",
     "IngestionResult",
     "InterviewGuideAnswer",
-    "InterviewGuideEntry",
-    "QuoteModeResponse",
     "QuoteResponseItem",
     "Theme",
     "ThemeEntry",

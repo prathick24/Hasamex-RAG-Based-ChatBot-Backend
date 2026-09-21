@@ -1,8 +1,7 @@
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models import ChatHistory, ErrorLog, LLMUsageLog
-from src.utils.exceptions.exceptions import DatabaseWriteError, RepositoryError
+from src.utils.exceptions.exceptions import DatabaseWriteError
 
 
 class AuditRepository:
@@ -97,27 +96,3 @@ class AuditRepository:
         except Exception as exc:
             await self._session.rollback()
             raise DatabaseWriteError(f"Failed to write LLM usage: {exc}") from exc
-
-    async def _list_rows(self, model, limit: int) -> list[dict]:
-        try:
-            stmt = select(model).order_by(model.id.desc()).limit(limit)
-            result = await self._session.execute(stmt)
-            rows = list(result.scalars())
-            return [self._row_to_dict(row) for row in rows]
-        except Exception as exc:
-            raise RepositoryError(f"Failed to read {model.__tablename__}") from exc
-
-    def _row_to_dict(self, row) -> dict:
-        return {
-            column.name: getattr(row, column.name)
-            for column in row.__table__.columns
-        }
-
-    async def list_chat_history(self, limit: int = 50) -> list[dict]:
-        return await self._list_rows(ChatHistory, limit)
-
-    async def list_error_logs(self, limit: int = 50) -> list[dict]:
-        return await self._list_rows(ErrorLog, limit)
-
-    async def list_llm_usage(self, limit: int = 50) -> list[dict]:
-        return await self._list_rows(LLMUsageLog, limit)

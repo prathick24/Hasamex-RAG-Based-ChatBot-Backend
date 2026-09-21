@@ -1,7 +1,11 @@
 import pytest
 
 from src.repositories.transcript_repository import TranscriptRepository
-from src.utils.exceptions.exceptions import DatabaseWriteError, RepositoryError, TranscriptNotFoundError
+from src.utils.exceptions.exceptions import (
+    DatabaseWriteError,
+    RepositoryError,
+    TranscriptNotFoundError,
+)
 
 
 class FakeResult:
@@ -78,7 +82,14 @@ async def test_list_transcripts():
     transcript = type(
         "T",
         (),
-        {"id": 1, "filename": "a.txt", "expert_name": "X", "expert_role": None, "market": "M", "chunk_count": 0},
+        {
+            "id": 1,
+            "filename": "a.txt",
+            "expert_name": "X",
+            "expert_role": None,
+            "market": "M",
+            "chunk_count": 0,
+        },
     )()
     repo = TranscriptRepository(make_session(FakeResult([transcript])))
     records = await repo.list_transcripts()
@@ -146,6 +157,29 @@ async def test_similarity_search_db_error():
     repo = TranscriptRepository(BoomSession())
     with pytest.raises(RepositoryError):
         await repo.similarity_search([0.1] * 384, top_k=5)
+
+
+async def test_question_search_empty():
+    repo = TranscriptRepository(make_session(FakeResult([])))
+    results = await repo.question_search([0.1] * 384, top_k=2)
+    assert results == []
+
+
+async def test_question_search_returns_chunks():
+    row = _make_row(chunk_id=2, content="Q: adoption?\nA: steady growth")
+    repo = TranscriptRepository(make_session(FakeResult([row])))
+    results = await repo.question_search([0.1] * 384, top_k=2, transcript_id=1)
+    assert results[0].content == "Q: adoption?\nA: steady growth"
+
+
+async def test_question_search_db_error():
+    class BoomSession(FakeSession):
+        async def execute(self, stmt, params=None):
+            raise RuntimeError("question vector search down")
+
+    repo = TranscriptRepository(BoomSession())
+    with pytest.raises(RepositoryError):
+        await repo.question_search([0.1] * 384, top_k=2)
 
 
 async def test_keyword_search_returns_chunks():
@@ -261,22 +295,11 @@ async def test_upload_version_stores_chunk_count():
     assert session.added[0].chunk_count == 1
 
 
-async def test_soft_delete_transcript_active():
-    transcript = type("T", (), {"id": 9, "filename": "a.txt", "is_active": True})()
-    repo = TranscriptRepository(make_session(FakeResult([transcript])))
-    filename = await repo.soft_delete_transcript(9)
-    assert filename == "a.txt"
-    assert transcript.is_active is False
-
-
-async def test_soft_delete_transcript_missing():
-    repo = TranscriptRepository(make_session(FakeResult([])))
-    assert await repo.soft_delete_transcript(9) is None
-
-
 def _make_row(chunk_id=1, content="x"):
     row = type("Row", (), {})()
-    row.Chunk = type("Chunk", (), {"id": chunk_id, "timestamp": "00:01", "content": content, "transcript_id": 1})()
+    row.Chunk = type(
+        "Chunk", (), {"id": chunk_id, "timestamp": "00:01", "content": content, "transcript_id": 1}
+    )()
     row.filename = "a.txt"
     row.expert_name = "X"
     row.market = "M"

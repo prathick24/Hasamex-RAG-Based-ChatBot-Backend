@@ -75,6 +75,8 @@ async def test_ingest_all_flows(tmp_path):
     assert transcripts[0]["expert_name"] == "Dr. Test"
     assert chunks[0]["content"] == "Q: hello\nA: adoption is steady"
     assert len(chunks[0]["embedding"]) == 384
+    assert len(chunks[0]["question_embedding"]) == 384
+    assert "question" not in chunks[0]
 
 
 async def test_ingest_bundles_interviewer_question_with_expert_answer(tmp_path):
@@ -127,6 +129,8 @@ async def test_ingest_embeds_all_expert_chunks():
     ]
     await svc._embed_chunks(chunks)
     assert all("embedding" in c for c in chunks)
+    assert all("question_embedding" in c for c in chunks)
+    assert all("question" not in c for c in chunks)
 
 
 async def test_ingest_single_file_flows_updates():

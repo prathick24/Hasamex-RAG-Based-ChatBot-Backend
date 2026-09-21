@@ -50,11 +50,11 @@ class DatabaseSessionManager:
         statements = (
             "ALTER TABLE transcripts "
             "ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
-            "ALTER TABLE transcripts "
-            "ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE transcripts DROP CONSTRAINT IF EXISTS transcripts_filename_key",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_transcripts_active_filename "
             "ON transcripts (filename) WHERE is_active",
+            "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS question_embedding VECTOR(384)",
             "UPDATE transcripts t "
             "SET chunk_count = sub.c "
             "FROM (SELECT transcript_id, COUNT(*) AS c FROM chunks GROUP BY transcript_id) sub "

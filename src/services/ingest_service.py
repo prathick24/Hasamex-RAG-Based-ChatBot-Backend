@@ -41,9 +41,7 @@ class IngestService:
             raise IngestionError(f"No .txt transcript files found in {self._transcript_dir}")
         return files
 
-    def _build_expert_chunks(
-        self, parsed_transcript, include_filename: bool = True
-    ) -> list[dict]:
+    def _build_expert_chunks(self, parsed_transcript, include_filename: bool = True) -> list[dict]:
         chunks: list[dict] = []
         pending_question: str | None = None
         for turn in parsed_transcript.turns:
@@ -55,6 +53,7 @@ class IngestService:
                 "speaker_index": turn.speaker_index,
                 "timestamp": turn.timestamp,
                 "content": _bundle_expert_answer(turn.content, pending_question),
+                "question": pending_question or "",
             }
             if include_filename:
                 chunk["filename"] = parsed_transcript.filename
@@ -90,12 +89,19 @@ class IngestService:
             raise IngestionError(f"Ingestion failed: {exc}") from exc
 
     async def _embed_chunks(self, chunks: list[dict]) -> None:
-        contents = [chunk["content"] for chunk in chunks]
-        for start in range(0, len(contents), MAX_CONCURRENT_EMBEDS):
-            batch = contents[start : start + MAX_CONCURRENT_EMBEDS]
-            embeddings = await asyncio.to_thread(self._embedder.embed, batch)
+        for start in range(0, len(chunks), MAX_CONCURRENT_EMBEDS):
+            batch = chunks[start : start + MAX_CONCURRENT_EMBEDS]
+            contents = [chunk["content"] for chunk in batch]
+            embeddings = await asyncio.to_thread(self._embedder.embed, contents)
             for i, embedding in enumerate(embeddings):
-                chunks[start + i]["embedding"] = embedding
+                batch[i]["embedding"] = embedding
+
+            questions = [chunk.get("question", "") for chunk in batch]
+            question_embeddings = await asyncio.to_thread(self._embedder.embed, questions)
+            for i, question_embedding in enumerate(question_embeddings):
+                batch[i]["question_embedding"] = question_embedding
+            for chunk in batch:
+                chunk.pop("question", None)
 
     async def ingest_single_file(self, filename: str, content: str) -> dict:
         """Parse and persist one uploaded transcript, replacing any older version
@@ -134,9 +140,3 @@ class IngestService:
 
     async def list_ingested(self) -> list[TranscriptRecord]:
         return await self._repository.list_transcripts()
-
-    async def delete_transcript(self, transcript_id: int) -> bool:
-        filename = await self._repository.soft_delete_transcript(transcript_id)
-        if filename:
-            purge_by_prefix(f"interview_guide_batch::{filename}::")
-        return bool(filename)

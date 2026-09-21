@@ -31,9 +31,9 @@ The application performs end-to-end analysis of three plain-text expert-call tra
 2. **Embedding:** Every chunk is embedded with `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) locally — no external embedding API.
 3. **Storage:** Chunks + embeddings are stored in PostgreSQL with the pgvector extension (cosine similarity via `<=>`). Ingestion is idempotent (`ON CONFLICT DO NOTHING` on transcript_id + speaker_index).
 4. **Interview Guide Answers:** For each of the 6 questions and each expert, retrieval is scoped to that expert's transcript only, and the LLM (Groq, open-source model) generates an answer with citations. Retrieval per-expert prevents cross-expert contamination.
-5. **Exact Quote Extraction:** Built into the chat — when the user requests a verbatim quote, the LLM is bypassed and hybrid search (semantic + keyword) returns verified verbatim chunks with timestamps.
+5. **Exact Quote Extraction:** Built into the chat — EVERY question returns hybrid search (semantic + keyword) verified verbatim chunks with timestamps alongside the LLM answer, so no mode selection is needed.
 6. **Themes & Disagreements:** Per interview-guide topic, chunks from all three experts are retrieved and the LLM returns a theme breakdown labelled `Consensus` / `Disagreement` / `Emphasis` with citations.
-7. **Cross-Transcript Q&A:** The user's free-form question is embedded, top-K chunks are retrieved across ALL transcripts via cosine similarity, and the LLM generates a grounded answer with citations — or a friendly "couldn't find it in these transcripts" reply when nothing relevant is found. Greetings/pleasantries short-circuit to a polite scope message.
+7. **Cross-Transcript Q&A:** The user's free-form question is embedded, top-K chunks are retrieved across ALL transcripts via cosine similarity, and the LLM generates a grounded answer with citations — plus verified verbatim quotes for every question. When nothing relevant is found (or for greetings/capability questions), a dedicated scope system prompt drives the LLM to produce a warm, varied conversational scope reply; canned strings are only the fallback if the LLM is unavailable.
 
 The application follows the layered architecture mandated by the project standards: Routes → Middleware → Services → Repositories → Data Store, with Groq LLM and local sentence-transformers accessed via client modules. A Streamlit frontend consumes the FastAPI backend. The UI is simple and usable: tabs for Interview Guide Answers, Themes & Disagreements, and Ask a Question (which includes exact-quote retrieval).
 
@@ -100,9 +100,11 @@ For each of the six interview-guide questions, the application returns an answer
 5. What adoption trend do you expect over the next 3–5 years?
 6. What is the typical hospital decision-making timeline for purchasing a new robotic system?
 
-##### Retrieval (scoped per expert):
-- Query embedding of the interview question is generated with the same sentence-transformers model.
-- Top-K (default 3) chunks retrieved from the expert's transcript only: `WHERE transcripts.id = :expert_id ORDER BY embedding <=> :query_vec LIMIT :k`.
+##### Retrieval (scoped per expert, question↔question):
+- The guide question alone is embedded with the same sentence-transformers model.
+- Every chunk stores two vectors: `embedding` over the bundled `Q: …\nA: …` text (used by the Themes and Q&A indexes) and `question_embedding` over only its interviewer question (the guide index).
+- The guide matches question-to-question on `question_embedding` — no distance cutoff — because the guide questions are fixed, so the near-verbatim question match always ranks the correct chunk.
+- Top-2 chunks retrieved from the expert's transcript only: `WHERE transcripts.id = :expert_id AND chunks.question_embedding IS NOT NULL ORDER BY chunks.question_embedding <=> :question_vec LIMIT 2`.
 - This guarantees no cross-expert leakage in the answer.
 
 ##### Generation:
@@ -128,19 +130,15 @@ For each of the six interview-guide questions, the application returns an answer
 ##### <u>1.2.3 FR-003: Exact Quote Extraction with Verification (via Chat)</u>
 
 ##### Description:
-Quote retrieval is built into the chat endpoint — there is no separate quotes page/endpoint. When the user asks for an exact quote, the system skips the LLM entirely and returns raw verbatim chunks from the transcripts, each verified programmatically and cited with its timestamp.
+Quote retrieval is built into the chat endpoint — there is no separate quotes page/endpoint. EVERY call to the chat endpoint returns a verbatim-quote section in addition to the LLM answer: raw transcript chunks, each verified programmatically and cited with its timestamp, so claims can be checked word-for-word.
 
-##### Intent detection:
-- `POST /api/v1/qa/ask` auto-detects an "exact quote" intent from phrasing such as "give me the exact quote about X", "quote what X said about Y".
-- An explicit `mode: "quote"` request parameter is also accepted as manual override (auto-detect is default).
-
-##### Hybrid Search (quote mode):
+##### Hybrid Search (quotes section):
 - Semantic: embed the query, cosine search across all chunks (`<=>`).
 - Keyword: ILIKE / tsvector match on `chunks.content` for exact-term recall (e.g. "budget approval").
 - Results merged; deduplicated by chunk id; top-K returned.
 
 ##### No-LLM guarantee:
-- In quote mode, no LLM generation happens — retrieval output IS the response. No AI interpretation is applied.
+- The quotes section is the raw retrieval output — no LLM generation or rewriting. No AI interpretation is applied; the LLM is only used for the separate synthesis answer.
 
 ##### Quote Verification (hallucination gate):
 1. Retrieved chunk content is used verbatim (no LLM quote selection).
@@ -154,7 +152,7 @@ Quote retrieval is built into the chat endpoint — there is no separate quotes 
 ##### Acceptance Criteria:
 - Quotes are exact substrings of stored chunk content (verifiable).
 - Each quote carries transcript_file, expert_name, market, timestamp.
-- Quote mode performs zero LLM calls.
+- The quotes section performs zero additional LLM calls.
 - Multiple matching experts each surface with their own citation.
 
 ---
@@ -165,9 +163,9 @@ Quote retrieval is built into the chat endpoint — there is no separate quotes 
 The application surfaces, per interview-guide topic, what the three experts agree on (consensus), where they differ (disagreement), and where they simply differ in emphasis.
 
 ##### Process:
-- For each of the 6 topics/question, run a single cross-corpus similarity search retrieving the top-K most similar chunks across all three transcripts (each tagged by expert); the interview-guide retrieval results may be reused where available.
-- Assemble the retrieved chunks into one context block tagged by expert.
-- LLM analysed with a typed output contract returning:
+- For each of the 6 topics/question, run per-expert similarity search (top-K within each expert transcript, no distance cutoff) and merge the scoped results by chunk id (each chunk tagged by expert). Per-expert scoping prevents the single-global-search failure mode where a topic's passages from one expert rank below the global cutoff and silently vanish.
+- Assemble the retrieved chunks into one context block tagged `[timestamp] [expert (market)] [file]` (real filename exposed so citations carry true source filenames, RULE-205).
+- LLM called with `task="themes"`, `max_tokens=4096` (room for the full themes JSON + citations), typed output contract returning:
 ```
 {
   "topic": str,
@@ -198,36 +196,33 @@ The application surfaces, per interview-guide topic, what the three experts agre
 ##### <u>1.2.5 FR-005: Cross-Transcript Question Answering (RAG Chat)</u>
 
 ##### Description:
-Single chat endpoint supporting two modes: (1) RAG answer — free-form question answered from the most relevant chunks across ALL transcripts with citations; (2) exact quote — verbatim chunks returned without LLM interpretation (see FR-003).
+Single chat endpoint. Every question returns BOTH: (1) a RAG answer — free-form question answered from the most relevant chunks across ALL transcripts with citations; and (2) verified verbatim quotes — hybrid-search chunks returned alongside (see FR-003). No mode selection exists; the response always contains both.
 
-##### Flow (mode=answer):
+##### Flow (every question):
 1. User question embedded (`all-MiniLM-L6-v2`).
 2. Top-K (default 5) chunks retrieved across all transcripts via `ORDER BY embedding <=> :query_vec LIMIT :k`.
 3. Retrieved chunks become the grounding context for the LLM (temperature ≤ 0.2).
 4. LLM returns answer + citations in typed JSON contract.
+5. In parallel, hybrid search (semantic + keyword) retrieves verbatim chunks for the quotes section; merged, deduplicated by chunk id.
+6. Route returns `{question, mode, answer, citations, quotes}` — frontend renders the answer + Sources + verbatim quotes.
 
-##### Flow (mode=quote):
-1. Intent detection classifies the question as a quote request.
-2. Hybrid search (semantic + keyword) retrieves verbatim chunks.
-3. No LLM call; chunks returned directly with citations + verification_status.
-
-##### System prompt critical rules (mode=answer):
+##### System prompt critical rules:
 - Use ONLY the provided context.
 - Never add information not present in the context.
 - If context does not answer the question, reply politely that the answer could not be found in these transcripts and name what the interviews do cover.
 - Cite each claim with its source chunk (transcript, expert, timestamp).
 
 ##### Empty/relevance guard:
-- If all retrieved chunks fall below a similarity threshold, return a graceful, friendly "could not find it in these transcripts" response that names the covered topics (no guessing).
-- Greetings, pleasantries, and capability questions (e.g. "hi", "thank you", "what can you do?") short-circuit to a polite scope message without retrieval or LLM cost.
+- If all retrieved chunks fall below a similarity threshold, route the question to the LLM scope reply: warm, varied, conversational, naming the covered topics (no guessing). Canned messages are the fallback only if the LLM call fails.
+- Greetings, pleasantries, and capability questions (e.g. "hi", "thank you", "what can you do?") short-circuit to the same LLM scope reply (no retrieval), produced from the scope system prompt and cached per question.
 
 ##### Statelessness:
 - The endpoint is stateless; the frontend owns conversation history display.
 
 ##### Acceptance Criteria:
 - Any question on adoption/barriers/ROI/training/trends/timeline answered with citations.
-- "Exact quote" phrasing bypasses the LLM and returns verified verbatim chunks.
-- Greetings/pleasantries return a friendly scope message; off-topic or unanswerable questions receive a polite "could not find it in these transcripts" reply naming the covered topics.
+- Every response also includes verified verbatim quotes (hybrid search, no LLM) — no mode selection or intent detection required.
+- Greetings/pleasantries and off-topic or unanswerable questions receive an LLM-generated conversational scope reply (varied wording, names the covered topics); canned messages are only the fallback if the LLM is unavailable.
 - Every citation is verifiable against the source transcript.
 - No cross-tenant or cross-user state (stateless).
 
@@ -264,7 +259,7 @@ A simple single-page Streamlit app exposing three analysis views, calling only t
 |-----|---------|
 | Interview Guide Answers | 6 questions; per expert answer with expandable citations (timestamp + quote) |
 | Themes & Disagreements | Per-topic theme cards labelled Consensus / Disagreement / Emphasis with citations |
-| Ask a Question | Chat-style input; assistant reply with answer + citations; exact-quote requests return verbatim quotes |
+| Ask a Question | Chat-style input; assistant reply with LLM answer + citations AND verbatim quotes for every question |
 
 ##### Behaviour:
 - Spinner/loading states during backend calls.
@@ -285,12 +280,12 @@ A simple single-page Streamlit app exposing three analysis views, calling only t
 ##### <u>1.2.8 FR-008: Internal Traceability (Record Keeping)</u>
 
 ##### Description:
-A durable record of what the backend actually did — Q&A turns, errors, and every Groq call — stored in three tables and readable through simple API endpoints, so an operator can audit behaviour after the fact without trusting memory or only grepping logs.
+A durable record of what the backend actually did — Q&A turns, errors, and every Groq call — stored in three tables, so an operator can audit behaviour after the fact without trusting memory or only grepping logs.
 
 ##### Tables:
 | Table | Rows |
 |-------|------|
-| `chat_history` | One row per Q&A turn: question, mode (answer/quote), answer, citations (JSON), verification status, model, latency, timestamp |
+| `chat_history` | One row per Q&A turn: question, mode (`answer`), answer, citations (JSON), verification status, model, latency, timestamp |
 | `error_logs` | One row per recorded failure: level, component (`qa`/`themes`/`guide`/…), message, exception type, endpoint, method, structured detail (JSON), timestamp |
 | `llm_usage_log` | One row per Groq call: task (`qa_answer`/`themes`/`guide_batch`/…), model, prompt/completion/total tokens, latency, success, timestamp |
 
@@ -298,12 +293,12 @@ A durable record of what the backend actually did — Q&A turns, errors, and eve
 - Recording is **best-effort**: each write opens its own short-lived session; a storage failure is logged and never aborts the primary request or streaming contract.
 - The Groq client reports every call (tokens + latency + success) through an injected usage recorder wired in `get_services()`; failed calls are recorded too.
 - Service and route error paths record into `error_logs`: theme/guide per-item failures inside the guard clauses, Q&A `LLMError`s in the route.
-- Read endpoints: `GET /api/v1/chat/history`, `GET /api/v1/error-logs`, `GET /api/v1/llm-usage` — each returns the most recent `limit` rows (default 50, max 500).
+- Traceability is inspected **directly in the database**; the operator read endpoints (`GET /chat/history`, `/error-logs`, `/llm-usage`) were removed because no client used them.
 
 ##### Acceptance Criteria:
 - Every Q&A turn, LLM call, and recorded error is persisted to the DB.
 - Regardless of DB state, the primary request behaviour (including streaming) is identical — recording can only add a log line.
-- The three read endpoints return well-formed JSON lists, newest first.
+- The traceability tables are populated correctly (verified via direct SQL).
 
 #### <u>1.3 Project Artifacts</u>
 
@@ -396,8 +391,8 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 
 #### <u>2.2.3 Availability and Reliability</u>
 
-- Groq client retry with exponential backoff (tenacity: 5 attempts, 2s→10s); 429/5xx handled.
-- Graceful degradation: if Groq is down, API returns a structured error, frontend shows retry message.
+- Groq client retry: tenacity exponential backoff (5 attempts, 2s→10s) on 5xx only; 429s honor Groq's `Retry-After`/reset headers (sleep-and-retry when <60s, raise `LLMRateLimitError` immediately when ≥60s or unknown — no blind backlog re-fills).
+- Graceful degradation: if Groq is down or rate-limited, API returns a structured error, frontend shows retry message.
 - Idempotent ingestion → safe restarts.
 - Readiness endpoint fails (503) if DB/pgvector/tables unavailable, guiding the demo.
 
@@ -430,7 +425,7 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 - Free-form cross-transcript Q&A (RAG) with "not mentioned" guard.
 - Strict citation + hallucination control (typed contracts, grounding, verified quotes).
 - FastAPI backend with versioned routes (`/api/v1`), health/ready endpoints.
-- Transcript upload API (`POST /api/v1/transcripts/upload`, `GET /api/v1/transcripts`, `DELETE /api/v1/transcripts/{id}`) with per-file results, soft-delete (`is_active`), and per-filename versioning so replaced files disappear from all retrieval and cached analysis.
+- Transcript upload API (`POST /api/v1/transcripts/upload`, `GET /api/v1/transcripts`) with per-file results, soft-replace (`is_active`), and per-filename versioning so replaced files disappear from all retrieval and cached analysis. Corpus population happens automatically via startup auto-seed.
 - NDJSON streaming endpoints for interview-guide and themes (`/interview-guide/stream`, `/themes/stream`) so the frontend renders results progressively as batches/topics complete.
 - Streamlit frontend with 3 tabs consuming the API.
 - Structured logging; rich cache for deterministic LLM outputs.
@@ -461,36 +456,33 @@ The application runs locally, not deployed. It requires: PostgreSQL 18 with pgve
 
 #### <u>4.2 Sequence Diagram</u>
 
-**Flow: Cross-Transcript Q&A (`POST /api/v1/qa/ask`) — answer mode**
+**Flow: Cross-Transcript Q&A (`POST /api/v1/qa/ask`) — combined answer + quotes**
 
 1. Frontend POSTs `{"question": "What slows down adoption in Germany?"}` to `/api/v1/qa/ask`.
 2. Route validates request via Pydantic DTO → 422 on invalid input.
-3. Intent detection confirms `mode=answer` (normal question).
+3. Service checks `detect_off_topic()`; greetings/capability questions short-circuit to the LLM scope reply (`task="qa_scope"`, no retrieval, cached per question).
 4. Service embeds question with sentence-transformers.
 5. Repository executes vector search across ALL chunks (`ORDER BY embedding <=> :q LIMIT 5`).
-6. If no chunk above similarity threshold → service returns the friendly "could not find it in these transcripts" fallback with empty citations.
+6. If no chunk above similarity threshold → service routes to the same LLM scope reply (warm, conversational, names covered topics) with empty citations; canned messages only if the LLM call fails.
 7. Otherwise service assembles prompt (system rules + retrieved chunks + user question).
-8. GroqClient calls LLM; tenacity retry on 429/5xx (5 attempts).
+8. GroqClient calls LLM (tenacity retry on 5xx; 429s drained via reset headers/`Retry-After` or raised as `LLMRateLimitError`).
 9. Service parses+validates JSON against typed response contract.
 10. For every citation quote, service runs substring verification against chunk content.
-11. Route returns `{question, mode, answer, citations}` → frontend renders answer + citations.
+11. In parallel, `_collect_quotes()` merges semantic + keyword hits (dedup by chunk id) into the `quotes` section — raw transcript text, no LLM; keyword-hit chunks flagged `verified`.
+12. Route returns `{question, mode, answer, citations, quotes}` → frontend renders answer + Sources + verbatim quotes.
 
-**Flow: Cross-Transcript Q&A — quote mode (no LLM)**
+**Flow: Ingestion (auto-seed at startup)**
 
-1. Frontend POSTs `{"question": "exact quote about budget approval"}` to `/api/v1/qa/ask`.
-2. Intent detection classifies `mode=quote`.
-3. Service embeds question and runs hybrid search (semantic + keyword + keyword-hit filter).
-4. Repository returns top-K verbatim chunks with transcript/expert/timestamp metadata.
-5. Service flags `verification_status` per chunk (keyword-hit chunks = verified; semantic-only below threshold = dropped).
-6. Route returns `{question, mode, quotes, citations}` → frontend renders quote cards. No LLM call is made.
-
-**Flow: Ingestion (`POST /api/v1/transcripts`)**
+Triggered from the FastAPI lifespan when the database has no active transcripts
+(guarded by `Settings.seed_on_startup`, default true); the bulk-ingest
+`POST /api/v1/transcripts` endpoint was removed in the API simplification.
 
 1. Service lists `.txt` files in `datas/`.
 2. For each file: parse header (expert/role/market), split body by timestamps, assign speaker/speaker_index.
 3. Embed each chunk with sentence-transformers.
 4. Repository upserts transcripts then chunks (`ON CONFLICT DO NOTHING`).
 5. Returns final transcripts_count and chunks_count.
+6. Best-effort: any failure is logged, never blocks startup, and the seed is skipped whenever transcripts already exist (restart-safe).
 
 **Flow: Transcript Upload (`POST /api/v1/transcripts/upload`)**
 

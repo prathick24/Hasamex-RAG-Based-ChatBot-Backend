@@ -104,3 +104,37 @@ def test_verify_citations_cross_expert_fallback():
     )
     assert len(citations) == 1
     assert dropped == []
+
+
+def test_verify_citations_replaces_fabricated_filename_with_real_chunk_metadata():
+    chunk = FakeChunk(
+        content="Training matters, especially in the first year.",
+        expert_name="Dr. Jean Martin",
+        transcript_file="Transcript_1_France.txt",
+        market="France",
+        timestamp="03:10",
+    )
+    citations, dropped = verify_citations(
+        [
+            {
+                "transcript_file": "interview.txt",
+                "expert_name": "Dr. Jean Martin",
+                "market": "France",
+                "timestamp": "03:10",
+                "quote": "Training matters, especially in the first year.",
+            }
+        ],
+        [chunk_to_dict(chunk)],
+    )
+    assert len(citations) == 1
+    assert dropped == []
+    assert citations[0].transcript_file == "Transcript_1_France.txt"
+    assert citations[0].expert_name == "Dr. Jean Martin"
+    assert citations[0].market == "France"
+    assert citations[0].timestamp == "03:10"
+
+
+def test_is_quote_in_content_folds_typographic_variants():
+    assert is_quote_in_content("costs around 15\u201320 percent", "costs around 15-20 percent")
+    assert is_quote_in_content("he said \u2018training matters\u2019", "he said 'training matters'")
+    assert is_quote_in_content("costs\u00a015 percent", "costs 15 percent")

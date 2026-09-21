@@ -62,6 +62,11 @@ class LLMParseError(ApplicationError):
         super().__init__(message, status_code=502, error_code=ERROR_LLM_PARSE_FAILED)
 
 
+class LLMRateLimitError(LLMError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=429)
+
+
 class DatabaseWriteError(ApplicationError):
     def __init__(self, message: str) -> None:
         super().__init__(message, status_code=500, error_code=ERROR_DB_WRITE_FAILED)

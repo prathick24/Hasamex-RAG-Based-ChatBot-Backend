@@ -50,29 +50,13 @@ paths:
   # ══════════════════════════════════════════════════
 
   /api/v1/transcripts:
-    post:
-      tags: [Transcripts]
-      summary: Ingest all transcripts
-      description: >
-        Reads all .txt transcripts from datas/, parses into timestamped chunks,
-        embeds chunks, and stores idempotently in PostgreSQL (ON CONFLICT DO NOTHING).
-      responses:
-        '200':
-          description: Ingestion summary (transcripts + chunks created/loaded)
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  transcripts_count: { type: integer }
-                  chunks_count: { type: integer }
-                  loaded: { type: boolean }
     get:
       tags: [Transcripts]
       summary: List active transcripts
       description: >
         Returns active (non-soft-deleted) transcripts with their expert metadata
-        and chunk counts, ordered by id.
+        and chunk counts, ordered by id. Population of the corpus happens
+        automatically at startup (auto-seed) when the database is empty.
       responses:
         '200':
           description: List of active transcript records
@@ -138,77 +122,19 @@ paths:
                         chunk_count: { type: integer }
                         reason: { type: string }
 
-  /api/v1/transcripts/{transcript_id}:
-    delete:
-      tags: [Transcripts]
-      summary: Soft-delete a transcript
-      description: >
-        Deactivates a transcript so it is excluded from retrieval, lists, and counts.
-        Its chunks remain in storage but are ignored by all active queries.
-      parameters:
-        - name: transcript_id
-          in: path
-          required: true
-          schema: { type: integer }
-      responses:
-        '200':
-          description: Deletion result
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  deleted: { type: boolean }
-
   # ══════════════════════════════════════════════════
   # Interview Guide Answers
   # ══════════════════════════════════════════════════
-
-  /api/v1/analysis/interview-guide:
-    get:
-      tags: [Analysis]
-      summary: Get interview guide answers for all experts
-      description: >
-        Returns the 6 interview-guide questions answered per expert, grounded in that
-        expert's transcript chunks only, with citations. Deterministic answers are cached.
-      responses:
-        '200':
-          description: Matrix of question x expert answers with citations
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    question_id: { type: integer }
-                    question: { type: string }
-                    answers:
-                      type: array
-                      items:
-                        type: object
-                        properties:
-                          question_id: { type: integer }
-                          expert: { type: string, description: Expert name }
-                          answer: { type: string }
-                          citations:
-                            type: array
-                            items:
-                              type: object
-                              properties:
-                                transcript_file: { type: string }
-                                expert_name: { type: string }
-                                market: { type: string }
-                                timestamp: { type: string }
-                                quote: { type: string }
 
   /api/v1/analysis/interview-guide/stream:
     get:
       tags: [Analysis]
       summary: Stream interview guide answers (NDJSON)
       description: >
-        Same data as /interview-guide but streamed line-by-line as Newline-Delimited JSON so
-        the frontend can render progress. Events:
+        The 6 interview-guide questions answered per expert (grounded in that expert's
+        transcript chunks only, with citations), streamed line-by-line as Newline-Delimited
+        JSON so the frontend can render progress. Deterministic answers are cached.
+        Events:
         - {"type":"meta","questions":[{"question_id","question"}]}  (once, first)
         - {"type":"batch","expert":str,"answers":[...]}  (one per expert batch, up to 3 questions)
         - {"type":"done"}
@@ -223,49 +149,14 @@ paths:
   # Themes & Disagreements
   # ══════════════════════════════════════════════════
 
-  /api/v1/analysis/themes:
-    get:
-      tags: [Analysis]
-      summary: Identify themes and disagreements across all experts
-      description: >
-        Groups findings per interview-guide topic and returns consensus points,
-        disagreements, and differences in emphasis, each with expert citations.
-      responses:
-        '200':
-          description: Theme list with type labels and citations
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    topic: { type: string }
-                    themes:
-                      type: array
-                      items:
-                        type: object
-                        properties:
-                          type: { type: string, enum: [Consensus, Disagreement, Emphasis] }
-                          summary: { type: string }
-                          citations:
-                            type: array
-                            items:
-                              type: object
-                              properties:
-                                transcript_file: { type: string }
-                                expert_name: { type: string }
-                                market: { type: string }
-                                timestamp: { type: string }
-                                quote: { type: string }
-
   /api/v1/analysis/themes/stream:
     get:
       tags: [Analysis]
       summary: Stream themes & disagreements (NDJSON)
       description: >
-        Same data as /themes but streamed line-by-line as Newline-Delimited JSON so the
-        frontend can render progress. Events:
+        Groups findings per interview-guide topic (consensus points, disagreements, and
+        differences in emphasis, each with expert citations), streamed line-by-line as
+        Newline-Delimited JSON so the frontend can render progress. Events:
         - {"type":"meta","topics":[{"index","topic"}]}  (once, first)
         - {"type":"topic","topic":str,"themes":[...]}  (one per topic)
         - {"type":"done"}
@@ -285,18 +176,19 @@ paths:
       tags: [Q&A]
       summary: Ask a free-form question across all transcripts
       description: >
-        Single chat endpoint with two operating modes:
+        Single Q&A endpoint. Every question returns BOTH:
 
-        1. RAG answer (default) — embeds the user question, retrieves top-K chunks from
-           all transcripts via cosine similarity, and generates a grounded answer with citations.
+        1. a RAG answer — question embedded, top-K chunks retrieved via cosine
+           similarity, grounded LLM answer with char-verified citations; and
 
-        2. Exact quote mode — when the user asks for a verbatim quote (e.g. "give me the exact
-           quote about X"), the LLM is skipped entirely: hybrid search (semantic + keyword)
-           returns raw verbatim chunks, each verified by substring match and returned with
-           its timestamp. No AI interpretation applied.
+        2. verbatim quotes — hybrid search (semantic + keyword) returns raw
+           transcript chunks (no LLM), each marked verified with its timestamp,
+           so claims can be checked word-for-word.
 
-        Mode is auto-detected from the question intent; an optional explicit `mode` override
-        is accepted.
+        When the question is off-topic or a greeting/capability message, the
+        response is a conversational LLM scope reply (dedicated scope system
+        prompt, free-text, cached per question) that explains what the interviews
+        cover; canned messages are only the fallback if the LLM call fails.
       requestBody:
         required: true
         content:
@@ -305,14 +197,10 @@ paths:
               type: object
               properties:
                 question: { type: string, example: "What slows down adoption in Germany?" }
-                mode:
-                  type: string
-                  description: Optional override; auto-detected when omitted.
-                  enum: [answer, quote]
                 top_k: { type: integer, default: 5 }
       responses:
         '200':
-          description: Grounded answer (mode=answer) with citations, OR verbatim quotes (mode=quote)
+          description: LLM answer with citations PLUS verified verbatim quotes
           content:
             application/json:
               schema:
@@ -321,13 +209,11 @@ paths:
                   question: { type: string }
                   mode:
                     type: string
-                    enum: [answer, quote]
-                  answer:
-                    type: string
-                    description: Present when mode=answer. Null/absent when mode=quote.
+                    enum: [answer]
+                  answer: { type: string }
                   quotes:
                     type: array
-                    description: Present when mode=quote. Each is a verified verbatim chunk.
+                    description: Verified verbatim chunks from the transcripts.
                     items:
                       type: object
                       properties:

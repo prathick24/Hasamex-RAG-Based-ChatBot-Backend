@@ -1,13 +1,9 @@
 import logging
 import re
 
-from src.prompt import build_qa_answer_messages
+from src.prompt import build_qa_answer_messages, build_scope_messages
 from src.repositories.schema.response import SimilarChunk
-from src.repositories.schema.schemas import (
-    AnswerModeResponse,
-    QuoteModeResponse,
-    QuoteResponseItem,
-)
+from src.repositories.schema.schemas import AnswerModeResponse, QuoteResponseItem
 from src.repositories.transcript_repository import TranscriptRepository
 from src.services.cache import acached_result, make_cache_key
 from src.services.citation_utils import (
@@ -16,6 +12,7 @@ from src.services.citation_utils import (
     verify_citations,
 )
 from src.settings import Settings
+from src.utils.exceptions.exceptions import ApplicationError
 
 logger = logging.getLogger("hasamex.qa")
 
@@ -43,32 +40,6 @@ SCOPE_CHITCHAT = re.compile(
     re.IGNORECASE,
 )
 
-QUOTE_INTENT_SUBSTRINGS = (
-    "exact quote",
-    "exact words",
-    "exact wording",
-    "verbatim",
-    "word for word",
-    "direct quote",
-    "quote exactly",
-    "quote the line",
-    "quote what",
-    "give me the quote",
-    "paste the quote",
-    "show the quote",
-    "please quote",
-)
-
-QUOTE_INTENT_REGEX = (r"what did .+ say (exactly|verbatim)",)
-
-
-def detect_quote_intent(question: str) -> bool:
-    """Auto-detect a quote request from the question phrasing (FR-003)."""
-    lowered = question.lower()
-    if any(substring in lowered for substring in QUOTE_INTENT_SUBSTRINGS):
-        return True
-    return any(re.search(pattern, question, re.IGNORECASE) for pattern in QUOTE_INTENT_REGEX)
-
 
 def detect_off_topic(question: str) -> bool:
     """Detect pure greetings / pleasantries / capability questions addressed to the bot."""
@@ -81,8 +52,61 @@ class QAService:
         self._deps = dependencies
         self._settings: Settings = dependencies.settings
 
+    async def _collect_quotes(self, question: str, top_k: int) -> list[QuoteResponseItem]:
+        query_embedding = self._deps.embedder.embed_one(question)
+        semantic_chunks = await self._repository.similarity_search(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            min_cosine_distance=self._settings.similarity_threshold,
+        )
+        keyword_chunks = await self._repository.keyword_search(question, top_k=top_k)
+
+        merged: dict[int, SimilarChunk] = {}
+        for chunk in semantic_chunks:
+            merged[chunk.chunk_id] = chunk
+        for chunk in keyword_chunks:
+            merged.setdefault(chunk.chunk_id, chunk)
+
+        return [
+            QuoteResponseItem(
+                quote=chunk.content,
+                transcript_file=chunk.transcript_file,
+                expert_name=chunk.expert_name,
+                market=chunk.market,
+                timestamp=chunk.timestamp,
+                verification_status="verified",
+            )
+            for chunk in merged.values()
+        ]
+
+    async def _scope_answer(self, question: str) -> str:
+        """LLM-generated conversational reply for greetings and out-of-scope
+        questions, guided by a role prompt. Falls back to the canned scope
+        message when the LLM is unavailable. Cached per question (no context).
+        """
+        cache_key = make_cache_key("qa_scope", self._settings.llm_model, question)
+
+        async def _produce() -> str:
+            from src.services.dependencies import get_groq_client
+
+            try:
+                groq = get_groq_client()
+                messages = build_scope_messages(question=question)
+                completion = await groq.create_completion(
+                    messages, temperature=0.7, max_tokens=200, task="qa_scope"
+                )
+            except ApplicationError:
+                logger.warning("scope_reply_llm_failed", exc_info=True)
+                return SCOPE_REPLY
+            content = (completion.get("content") or "").strip()
+            return content or SCOPE_REPLY
+
+        return await acached_result(cache_key, _produce)
+
     async def answer(self, question: str, top_k: int | None = None) -> AnswerModeResponse:
         k = top_k or self._settings.top_k
+        quotes = await self._collect_quotes(question, k)
+
         query_embedding = self._deps.embedder.embed_one(question)
         chunks = await self._repository.similarity_search(
             query_embedding=query_embedding,
@@ -94,8 +118,9 @@ class QAService:
             return AnswerModeResponse(
                 question=question,
                 mode="answer",
-                answer=NO_CONTEXT_FALLBACK,
+                answer=await self._scope_answer(question),
                 citations=[],
+                quotes=quotes,
             )
 
         context = build_citation_context(chunks)
@@ -122,80 +147,16 @@ class QAService:
             mode="answer",
             answer=answer,
             citations=citations,
-        )
-
-    async def quote(self, question: str, top_k: int | None = None) -> QuoteModeResponse:
-        k = top_k or self._settings.top_k
-        query_embedding = self._deps.embedder.embed_one(question)
-        semantic_chunks = await self._repository.similarity_search(
-            query_embedding=query_embedding,
-            top_k=k,
-            min_cosine_distance=self._settings.similarity_threshold,
-        )
-        keyword_chunks = await self._repository.keyword_search(question, top_k=k)
-
-        merged: dict[int, SimilarChunk] = {}
-        for chunk in semantic_chunks:
-            merged[chunk.chunk_id] = chunk
-        for chunk in keyword_chunks:
-            merged.setdefault(chunk.chunk_id, chunk)
-
-        quotes: list[QuoteResponseItem] = []
-        for chunk in merged.values():
-            status = "verified"
-            if chunk.distance is None:
-                status = "verified"
-            quotes.append(
-                QuoteResponseItem(
-                    quote=chunk.content,
-                    transcript_file=chunk.transcript_file,
-                    expert_name=chunk.expert_name,
-                    market=chunk.market,
-                    timestamp=chunk.timestamp,
-                    verification_status=status,
-                )
-            )
-
-        if not quotes:
-            return QuoteModeResponse(
-                question=question,
-                mode="quote",
-                answer="No exact quote found in the available transcripts.",
-                quotes=[],
-                citations=[],
-            )
-
-        citations, _ = verify_citations(
-            [
-                {
-                    "transcript_file": q.transcript_file,
-                    "expert_name": q.expert_name,
-                    "market": q.market,
-                    "timestamp": q.timestamp,
-                    "quote": q.quote,
-                }
-                for q in quotes
-            ],
-            [chunk_to_dict(chunk) for chunk in merged.values()],
-        )
-
-        return QuoteModeResponse(
-            question=question,
-            mode="quote",
-            answer=None,
             quotes=quotes,
-            citations=citations,
         )
 
-    async def ask(self, question: str, mode: str | None = None, top_k: int | None = None):
+    async def ask(self, question: str, top_k: int | None = None) -> AnswerModeResponse:
         if detect_off_topic(question):
             return AnswerModeResponse(
                 question=question,
                 mode="answer",
-                answer=SCOPE_REPLY,
+                answer=await self._scope_answer(question),
                 citations=[],
+                quotes=[],
             )
-        resolved_mode = mode or ("quote" if detect_quote_intent(question) else "answer")
-        if resolved_mode == "quote":
-            return await self.quote(question, top_k)
         return await self.answer(question, top_k)
